@@ -9,7 +9,83 @@ reqwest-client = ["dep:reqwest"]
 google = []
 github = []
 discord = []
-all-providers = ["google", "github", "discord", "testing"]
+forty-two = []
+amazon-cognito = []
+anilist = []
+apple = ["dep:p256", "dep:ecdsa"]
+atlassian = []
+auth0 = []
+authentik = []
+autodesk = []
+battle-net = []
+bitbucket = []
+box-oauth = []
+bungie = []
+coinbase = []
+donation-alerts = []
+dribbble = []
+dropbox = []
+epic-games = []
+etsy = []
+facebook = []
+figma = []
+gitea = []
+gitlab = []
+intuit = []
+kakao = []
+keycloak = []
+kick = []
+lichess = []
+line = []
+linear = []
+linkedin = []
+mastodon = []
+mercado-libre = []
+mercado-pago = []
+microsoft-entra-id = []
+my-anime-list = []
+naver = []
+notion = []
+okta = []
+osu = []
+patreon = []
+polar = []
+reddit = []
+roblox = []
+salesforce = []
+shikimori = []
+slack = []
+spotify = []
+start-gg = []
+strava = []
+synology = []
+tiktok = []
+tiltify = []
+tumblr = []
+twitch = []
+twitter = []
+vk = []
+withings = []
+workos = []
+yahoo = []
+yandex = []
+zoom = []
+all-providers = [
+    "google", "github", "discord",
+    "forty-two", "amazon-cognito", "anilist", "apple", "atlassian",
+    "auth0", "authentik", "autodesk", "battle-net", "bitbucket",
+    "box-oauth", "bungie", "coinbase", "donation-alerts", "dribbble",
+    "dropbox", "epic-games", "etsy", "facebook", "figma",
+    "gitea", "gitlab", "intuit", "kakao", "keycloak",
+    "kick", "lichess", "line", "linear", "linkedin",
+    "mastodon", "mercado-libre", "mercado-pago", "microsoft-entra-id",
+    "my-anime-list", "naver", "notion", "okta", "osu",
+    "patreon", "polar", "reddit", "roblox", "salesforce",
+    "shikimori", "slack", "spotify", "start-gg", "strava",
+    "synology", "tiktok", "tiltify", "tumblr", "twitch",
+    "twitter", "vk", "withings", "workos", "yahoo",
+    "yandex", "zoom", "testing",
+]
 testing = []
 
 [dependencies]
@@ -21,6 +97,8 @@ base64 = "0.22"
 rand = "0.9"
 thiserror = "2"
 reqwest = { version = "0.12", features = ["json"], optional = true }
+p256 = { version = "0.13", optional = true }
+ecdsa = { version = "0.16", features = ["signing"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

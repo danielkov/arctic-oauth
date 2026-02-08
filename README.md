@@ -12,6 +12,7 @@ Rust-first OAuth 2.0 authorization-code client that ports the ergonomics of the 
 - [Additional examples](#additional-examples)
 - [API design rationale](#api-design-rationale)
 - [Core building blocks](#core-building-blocks)
+- [Supported providers](#supported-providers)
 - [Use cases](#use-cases)
 - [Trade-offs & limitations](#trade-offs--limitations)
 - [Testing & quality](#testing--quality)
@@ -39,7 +40,7 @@ Rust-first OAuth 2.0 authorization-code client that ports the ergonomics of the 
 | State (anti-CSRF) generator                         | ✅                                    |
 | ID token (JWT) payload decoding                     | ✅ (no signature verification)        |
 | Pluggable HTTP client trait                         | ✅                                    |
-| Built-in providers                                  | Google, GitHub, Discord (more coming) |
+| Built-in providers                                  | 64 providers (see full list below)    |
 | Token refresh helpers                               | ✅ (per provider support)             |
 | RFC 7009 token revocation                           | ✅ (where the provider supports it)   |
 | Other grants (implicit, device, client credentials) | ❌ (out of scope)                     |
@@ -57,11 +58,11 @@ Feature flags:
 | Flag                       | Enables                                                                                                                                      |
 | -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `reqwest-client` (default) | `ReqwestClient`, a drop-in `HttpClient` backed by `reqwest`                                                                                  |
-| `google`                   | `Google` provider exports                                                                                                                    |
-| `github`                   | `GitHub` provider exports                                                                                                                    |
-| `discord`                  | `Discord` provider exports                                                                                                                   |
-| `all-providers`            | Convenience flag that enables `google`, `github`, and `discord`                                                                              |
+| `<provider>`               | Individual provider export (e.g. `google`, `github`, `discord`, `spotify`, `twitter`, etc.)                                                  |
+| `all-providers`            | Convenience flag that enables all 64 providers plus `testing`                                                                                |
 | `testing`                  | Exposes constructors like `with_endpoints` outside of tests so you can point providers at custom OAuth servers in your own integration suite |
+
+Each provider has its own feature flag matching its kebab-case name (e.g. `microsoft-entra-id`, `epic-games`, `my-anime-list`). See the [Supported providers](#supported-providers) section for the full list.
 
 Disable the default HTTP client if you prefer to supply your own implementation:
 
@@ -418,25 +419,88 @@ Trade-off: this design reduces cross-provider generic programming, but improves 
 
 ## Core building blocks
 
-- **Provider-specific clients.** Each provider (`Google`, `GitHub`, `Discord`) exposes only the methods and parameters it actually supports.
+- **Provider-specific clients.** Each provider exposes only the methods and parameters it actually supports.
 - **`OAuth2Client`.** Spec-compliant helper that most providers embed. It understands when to send credentials via HTTP Basic versus form body and automatically injects PKCE parameters.
 - **`HttpClient` trait.** Minimal abstraction with a single asynchronous `send` method. Ship your own implementation or rely on the built-in `ReqwestClient`.
 - **`OAuth2Tokens`.** Convenience wrapper around the raw JSON response. Provides typed accessors (`access_token()`, `scopes()`, `access_token_expires_at()`, etc.) and exposes the original `serde_json::Value` for provider-specific attributes.
 - **Utilities.** `generate_state`, `generate_code_verifier`, `create_code_challenge`, and `decode_id_token` let you reproduce the ergonomic helpers from Arctic JS without dragging in heavyweight crypto dependencies.
 
-### Provider capabilities
+### Supported providers
 
-| Provider | Feature flag | PKCE requirement | Refresh support | Revocation | Notes                                                                  |
-| -------- | ------------ | ---------------- | --------------- | ---------- | ---------------------------------------------------------------------- |
-| Google   | `google`     | Required (S256)  | ✅              | ✅         | Returns OIDC `id_token`, uses HTTP Basic auth                          |
-| GitHub   | `github`     | Not supported    | ❌              | ❌         | Automatically interprets OAuth errors even when returned with HTTP 200 |
-| Discord  | `discord`    | Optional         | ✅              | ✅         | Works for public (no secret) and confidential clients                  |
+The crate ships 64 pre-configured providers, each behind its own feature flag. Every provider encodes its production endpoints, HTTP authentication style, PKCE requirements, and spec deviations.
+
+| Provider | Feature flag | PKCE | Refresh | Revocation | Notes |
+| --- | --- | --- | --- | --- | --- |
+| Amazon Cognito | `amazon-cognito` | Required S256 | ✅ | ✅ | Requires `domain` parameter |
+| AniList | `anilist` | Not supported | ✅ | ❌ | |
+| Apple | `apple` | Not supported | ❌ | ❌ | Requires `team_id`, `key_id`, `pkcs8_private_key`; generates JWT client secret |
+| Atlassian | `atlassian` | Required S256 | ✅ | ❌ | |
+| Auth0 | `auth0` | Optional | ✅ | ✅ | Requires `domain` parameter |
+| Authentik | `authentik` | Required S256 | ✅ | ✅ | Requires `base_url` parameter |
+| Autodesk | `autodesk` | Not supported | ✅ | ❌ | |
+| Battle.net | `battle-net` | Not supported | ❌ | ❌ | |
+| Bitbucket | `bitbucket` | Not supported | ✅ | ❌ | |
+| Box | `box-oauth` | Not supported | ✅ | ✅ | |
+| Bungie | `bungie` | Not supported | ✅ | ❌ | Uses `X-API-Key` header |
+| Coinbase | `coinbase` | Not supported | ✅ | ✅ | |
+| Discord | `discord` | Optional | ✅ | ✅ | Supports public clients (optional secret) |
+| Donation Alerts | `donation-alerts` | Not supported | ✅ | ❌ | No `state` parameter |
+| Dribbble | `dribbble` | Not supported | ❌ | ❌ | |
+| Dropbox | `dropbox` | Required S256 | ✅ | ✅ | Supports public clients (optional secret) |
+| Epic Games | `epic-games` | Not supported | ✅ | ❌ | |
+| Etsy | `etsy` | Required S256 | ✅ | ❌ | |
+| Facebook | `facebook` | Not supported | ❌ | ❌ | |
+| Figma | `figma` | Not supported | ✅ | ❌ | Separate refresh endpoint |
+| 42 | `forty-two` | Not supported | ✅ | ❌ | |
+| Gitea | `gitea` | Not supported | ✅ | ❌ | Requires `base_url` parameter |
+| GitHub | `github` | Not supported | ❌ | ❌ | Returns errors with HTTP 200 |
+| GitLab | `gitlab` | Required S256 | ✅ | ✅ | Requires `base_url` parameter |
+| Google | `google` | Required S256 | ✅ | ✅ | Returns OIDC `id_token` |
+| Intuit | `intuit` | Not supported | ✅ | ✅ | |
+| Kakao | `kakao` | Not supported | ✅ | ❌ | |
+| KeyCloak | `keycloak` | Required S256 | ✅ | ✅ | Requires `realm_url` parameter |
+| Kick | `kick` | Not supported | ✅ | ❌ | |
+| Lichess | `lichess` | Required S256 | ❌ | ❌ | |
+| Line | `line` | Not supported | ✅ | ✅ | |
+| Linear | `linear` | Not supported | ✅ | ❌ | |
+| LinkedIn | `linkedin` | Required S256 | ✅ | ❌ | |
+| Mastodon | `mastodon` | Required S256 | ❌ | ✅ | Requires `base_url` parameter |
+| Mercado Libre | `mercado-libre` | Not supported | ✅ | ❌ | |
+| Mercado Pago | `mercado-pago` | Not supported | ✅ | ❌ | |
+| Microsoft Entra ID | `microsoft-entra-id` | Required S256 | ✅ | ❌ | Requires `tenant`; supports public clients |
+| MyAnimeList | `my-anime-list` | Required Plain | ✅ | ❌ | Uses Plain PKCE (not S256) |
+| Naver | `naver` | Not supported | ✅ | ❌ | No `state` or `scopes` parameters |
+| Notion | `notion` | Not supported | ❌ | ❌ | Adds `owner=user` parameter |
+| Okta | `okta` | Required S256 | ✅ | ✅ | Requires `domain`; optional `authorization_server_id` |
+| osu! | `osu` | Not supported | ✅ | ❌ | |
+| Patreon | `patreon` | Not supported | ✅ | ❌ | |
+| Polar | `polar` | Required S256 | ✅ | ✅ | Supports public clients (optional secret) |
+| Reddit | `reddit` | Not supported | ✅ | ❌ | |
+| Roblox | `roblox` | Required S256 | ✅ | ❌ | |
+| Salesforce | `salesforce` | Required S256 | ✅ | ✅ | Requires `domain` parameter |
+| Shikimori | `shikimori` | Not supported | ✅ | ❌ | |
+| Slack | `slack` | Not supported | ✅ | ❌ | Supports public clients (optional secret) |
+| Spotify | `spotify` | Optional | ✅ | ❌ | Supports public clients (optional secret) |
+| start.gg | `start-gg` | Not supported | ✅ | ❌ | Separate refresh endpoint |
+| Strava | `strava` | Not supported | ✅ | ❌ | Comma-delimited scopes |
+| Synology | `synology` | Required S256 | ❌ | ❌ | Requires `base_url`; uses `application_id`/`application_secret` |
+| TikTok | `tiktok` | Required S256 | ✅ | ✅ | Uses `client_key`; returns errors with HTTP 200 |
+| Tiltify | `tiltify` | Not supported | ✅ | ❌ | |
+| Tumblr | `tumblr` | Not supported | ✅ | ❌ | |
+| Twitch | `twitch` | Not supported | ✅ | ✅ | |
+| Twitter | `twitter` | Required S256 | ✅ | ✅ | Supports public clients (optional secret) |
+| VK | `vk` | Not supported | ❌ | ❌ | |
+| Withings | `withings` | Not supported | ❌ | ❌ | Comma-delimited scopes; wraps responses |
+| WorkOS | `workos` | Optional | ❌ | ❌ | Optional secret; no scopes parameter |
+| Yahoo | `yahoo` | Not supported | ✅ | ❌ | |
+| Yandex | `yandex` | Not supported | ✅ | ❌ | |
+| Zoom | `zoom` | Required S256 | ✅ | ✅ | |
 
 Use the `testing` feature (or plain `cargo test`) to access helper constructors such as `Google::with_endpoints` for pointing providers at mock OAuth servers.
 
 ## Use cases
 
-- Implement "Sign in with Google/GitHub/Discord" in async Rust web frameworks (Axum, Actix, Poem, etc.).
+- Implement "Sign in with X" in async Rust web frameworks (Axum, Actix, Poem, etc.) with 64 providers available out of the box.
 - Embed OAuth-backed desktop or CLI flows where you control the HTTP client stack and want deterministic mocks in tests.
 - Port TypeScript/Node.js apps that already rely on Arctic's behavior to a Rust backend without re-learning every provider's quirks.
 - Build middleware or SDKs that wrap provider-specific clients without hiding provider differences.
@@ -446,7 +510,7 @@ Use the `testing` feature (or plain `cargo test`) to access helper constructors 
 - **Authorization-code flow only.** There are no helpers for implicit, device-code, or client-credentials grants.
 - **Stateless utilities.** The crate never stores PKCE verifiers, CSRF state, or refresh tokens; you must persist and validate them.
 - **No JWT signature verification.** `decode_id_token` only base64url-decodes the payload. Bring your own JOSE/JWK validation if you need it.
-- **Limited provider catalog (for now).** v0.1 ships Google, GitHub, and Discord. Refer to the roadmap below for expansion plans.
+- **Authorization-code flow only per provider.** Each provider encodes its own endpoints and rules; adding a provider not in the catalog requires implementing the same pattern manually.
 - **Async-only.** There is no blocking API surface; call sites should run inside an async runtime.
 - **No automatic retries/backoff.** Error handling is explicit so you can plug in your own policies.
 
@@ -458,11 +522,10 @@ Use the `testing` feature (or plain `cargo test`) to access helper constructors 
 
 ## Roadmap
 
-1. Ship additional providers from the upstream Arctic JS catalog (Apple, Twitter, Microsoft Entra ID, Auth0, etc.).
-2. Expose higher-level helpers for multi-provider routing (e.g., a registry keyed by slug).
-3. Optional middleware utilities for Axum/Actix to streamline callback handling.
-4. Error reporting improvements (attach raw HTTP traces or response bodies behind feature flags).
-5. Explore lightweight JWT verification helpers without pulling full crypto stacks.
+1. Expose higher-level helpers for multi-provider routing (e.g., a registry keyed by slug).
+2. Optional middleware utilities for Axum/Actix to streamline callback handling.
+3. Error reporting improvements (attach raw HTTP traces or response bodies behind feature flags).
+4. Explore lightweight JWT verification helpers without pulling full crypto stacks.
 
 ## Related documents
 
