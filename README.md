@@ -10,6 +10,7 @@ Rust-first OAuth 2.0 authorization-code client that ports the ergonomics of the 
 - [Installation](#installation)
 - [Quick start](#quick-start)
 - [Additional examples](#additional-examples)
+- [API design rationale](#api-design-rationale)
 - [Core building blocks](#core-building-blocks)
 - [Use cases](#use-cases)
 - [Trade-offs & limitations](#trade-offs--limitations)
@@ -24,7 +25,7 @@ Rust-first OAuth 2.0 authorization-code client that ports the ergonomics of the 
 ## Why arctic-oauth?
 
 - **Provider-aware clients.** Each provider struct encodes its production endpoints, HTTP authentication style, PKCE requirements, and spec deviations (e.g., GitHub returning OAuth errors with HTTP 200).
-- **Minimal surface area.** The crate exposes a handful of core types (`OAuthProvider`, `OAuth2Client`, `OAuth2Tokens`, `HttpClient`) plus utilities for PKCE, CSRF state, and ID token decoding.
+- **Minimal surface area.** The crate exposes a handful of core types (`OAuth2Client`, `OAuth2Tokens`, `HttpClient`) plus utilities for PKCE, CSRF state, and ID token decoding.
 - **Bring-your-own HTTP stack.** Any async HTTP client that implements the lightweight `HttpClient` trait will work. A `reqwest` implementation is included behind the `reqwest-client` feature (enabled by default).
 - **Stateless by design.** No session store, clock skew, or token cache assumptions. You control persistence and verification.
 - **High test coverage.** Each module ships with unit tests, and every provider has an integration suite that drives mocked OAuth servers end-to-end.
@@ -90,7 +91,7 @@ impl HttpClient for MyClient {
 ```rust
 use arctic_oauth::{
     generate_code_verifier, generate_state, decode_id_token,
-    Google, OAuthProvider, ReqwestClient,
+    Google, ReqwestClient,
 };
 
 #[tokio::main]
@@ -108,13 +109,13 @@ async fn main() -> Result<(), arctic_oauth::Error> {
 
     // 3. Redirect the browser to the authorization URL
     let auth_url = google
-        .authorization_url(&state, &["openid", "email", "profile"], Some(&code_verifier))?;
+        .authorization_url(&state, &["openid", "email", "profile"], &code_verifier);
     println!("Redirect user to: {auth_url}");
 
     // 4. After the callback, exchange the authorization code for tokens
     let http = ReqwestClient::new();
     let tokens = google
-        .validate_authorization_code(&http, "authorization-code", Some(&code_verifier))
+        .validate_authorization_code(&http, "authorization-code", &code_verifier)
         .await?;
 
     println!("access_token = {}", tokens.access_token()?);
@@ -148,7 +149,7 @@ This example stores `oauth_state` and `oauth_code_verifier` in HttpOnly cookies 
 use std::sync::Arc;
 
 use arctic_oauth::{
-    generate_code_verifier, generate_state, Google, OAuthProvider, ReqwestClient,
+    generate_code_verifier, generate_state, Google, ReqwestClient,
 };
 use axum::{
     extract::{Query, State},
@@ -203,9 +204,8 @@ async fn login(
         .authorization_url(
             &oauth_state,
             &["openid", "email", "profile"],
-            Some(&code_verifier),
-        )
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            &code_verifier,
+        );
 
     let jar = jar
         .add(auth_cookie("oauth_state", oauth_state))
@@ -236,7 +236,7 @@ async fn callback(
     let http = ReqwestClient::new();
     let tokens = state
         .google
-        .validate_authorization_code(&http, &query.code, Some(&code_verifier))
+        .validate_authorization_code(&http, &query.code, &code_verifier)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     let access_token = tokens
@@ -274,7 +274,7 @@ Same flow as Axum, but using `HttpRequest::cookie` and `HttpResponse` cookie bui
 
 ```rust
 use arctic_oauth::{
-    generate_code_verifier, generate_state, Google, OAuthProvider, ReqwestClient,
+    generate_code_verifier, generate_state, Google, ReqwestClient,
 };
 use actix_web::{
     cookie::{
@@ -326,9 +326,8 @@ async fn login(state: web::Data<AppState>) -> Result<HttpResponse, actix_web::Er
         .authorization_url(
             &oauth_state,
             &["openid", "email", "profile"],
-            Some(&code_verifier),
-        )
-        .map_err(actix_web::error::ErrorInternalServerError)?;
+            &code_verifier,
+        );
 
     Ok(HttpResponse::Found()
         .append_header((header::LOCATION, auth_url.to_string()))
@@ -360,7 +359,7 @@ async fn callback(
     let http = ReqwestClient::new();
     let tokens = state
         .google
-        .validate_authorization_code(&http, &query.code, Some(&code_verifier))
+        .validate_authorization_code(&http, &query.code, &code_verifier)
         .await
         .map_err(actix_web::error::ErrorBadGateway)?;
     let access_token = tokens
@@ -403,9 +402,23 @@ Cookie persistence notes:
 - Keep OAuth helper cookies short-lived and clear them immediately after callback.
 - Always set `HttpOnly`, `Secure`, and an explicit `SameSite` policy.
 
+## API design rationale
+
+The provider API is intentionally **provider-specific** instead of trait-based.
+
+- **Avoid least-common-denominator signatures.** A shared trait pushed provider differences into runtime checks and optional parameters.
+- **Encode provider rules in method signatures.** Examples:
+  - `Google` requires `code_verifier: &str`.
+  - `GitHub` has no PKCE argument at all.
+  - `Discord` accepts `Option<&str>` because PKCE is truly optional.
+- **Expose only supported operations.** If a provider does not support a capability, the method is not on that provider type.
+- **Keep shared logic internal.** `OAuth2Client`, request building, and token parsing are reused internally without becoming the public abstraction boundary.
+
+Trade-off: this design reduces cross-provider generic programming, but improves correctness, readability, and API truthfulness for real provider behavior.
+
 ## Core building blocks
 
-- **`OAuthProvider` trait.** Normalizes how you construct authorization URLs, exchange codes, refresh tokens, and (optionally) revoke them. Each provider implements its own PKCE rules through `PkceRequirement`.
+- **Provider-specific clients.** Each provider (`Google`, `GitHub`, `Discord`) exposes only the methods and parameters it actually supports.
 - **`OAuth2Client`.** Spec-compliant helper that most providers embed. It understands when to send credentials via HTTP Basic versus form body and automatically injects PKCE parameters.
 - **`HttpClient` trait.** Minimal abstraction with a single asynchronous `send` method. Ship your own implementation or rely on the built-in `ReqwestClient`.
 - **`OAuth2Tokens`.** Convenience wrapper around the raw JSON response. Provides typed accessors (`access_token()`, `scopes()`, `access_token_expires_at()`, etc.) and exposes the original `serde_json::Value` for provider-specific attributes.
@@ -426,7 +439,7 @@ Use the `testing` feature (or plain `cargo test`) to access helper constructors 
 - Implement "Sign in with Google/GitHub/Discord" in async Rust web frameworks (Axum, Actix, Poem, etc.).
 - Embed OAuth-backed desktop or CLI flows where you control the HTTP client stack and want deterministic mocks in tests.
 - Port TypeScript/Node.js apps that already rely on Arctic's behavior to a Rust backend without re-learning every provider's quirks.
-- Build middleware or SDKs that expose a higher-level authentication abstraction by programming against the `OAuthProvider` trait.
+- Build middleware or SDKs that wrap provider-specific clients without hiding provider differences.
 
 ## Trade-offs & limitations
 

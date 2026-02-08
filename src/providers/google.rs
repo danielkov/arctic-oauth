@@ -2,7 +2,6 @@ use crate::client::OAuth2Client;
 use crate::error::Error;
 use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
-use crate::provider::{OAuthProvider, PkceRequirement};
 use crate::request::create_oauth2_request;
 use crate::tokens::OAuth2Tokens;
 
@@ -61,46 +60,38 @@ impl Google {
     }
 }
 
-impl OAuthProvider for Google {
-    fn name(&self) -> &'static str {
+impl Google {
+    pub fn name(&self) -> &'static str {
         "Google"
     }
 
-    fn pkce_requirement(&self) -> PkceRequirement {
-        PkceRequirement::Required
-    }
-
-    fn authorization_url(
-        &self,
-        state: &str,
-        scopes: &[&str],
-        code_verifier: Option<&str>,
-    ) -> Result<url::Url, Error> {
-        let code_verifier = code_verifier.ok_or(Error::MissingField {
-            field: "code_verifier",
-        })?;
-
-        Ok(self.client.create_authorization_url_with_pkce(
+    pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
+        self.client.create_authorization_url_with_pkce(
             &self.authorization_endpoint,
             state,
             CodeChallengeMethod::S256,
             code_verifier,
             scopes,
-        ))
+        )
     }
 
-    async fn validate_authorization_code(
+    pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
         code: &str,
-        code_verifier: Option<&str>,
+        code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, code_verifier)
+            .validate_authorization_code(
+                http_client,
+                &self.token_endpoint,
+                code,
+                Some(code_verifier),
+            )
             .await
     }
 
-    async fn refresh_access_token(
+    pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
         refresh_token: &str,
@@ -110,11 +101,7 @@ impl OAuthProvider for Google {
             .await
     }
 
-    fn supports_token_revocation(&self) -> bool {
-        true
-    }
-
-    async fn revoke_token(
+    pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
         token: &str,
@@ -223,35 +210,9 @@ mod tests {
     }
 
     #[test]
-    fn pkce_requirement_is_required() {
-        let google = Google::new("cid", "secret", "https://app/cb");
-        assert_eq!(google.pkce_requirement(), PkceRequirement::Required);
-    }
-
-    #[test]
-    fn supports_token_revocation_returns_true() {
-        let google = Google::new("cid", "secret", "https://app/cb");
-        assert!(google.supports_token_revocation());
-    }
-
-    #[test]
-    fn authorization_url_errors_without_code_verifier() {
-        let google = Google::new("cid", "secret", "https://app/cb");
-        let result = google.authorization_url("state", &["openid"], None);
-        assert!(matches!(
-            result,
-            Err(Error::MissingField {
-                field: "code_verifier"
-            })
-        ));
-    }
-
-    #[test]
     fn authorization_url_includes_pkce_params() {
         let google = Google::new("cid", "secret", "https://app/cb");
-        let url = google
-            .authorization_url("state123", &["openid", "email"], Some("my-verifier"))
-            .unwrap();
+        let url = google.authorization_url("state123", &["openid", "email"], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
         assert!(pairs.contains(&("response_type".into(), "code".into())));
@@ -284,7 +245,7 @@ mod tests {
         }]);
 
         let tokens = google
-            .validate_authorization_code(&mock, "auth-code", Some("verifier"))
+            .validate_authorization_code(&mock, "auth-code", "verifier")
             .await
             .unwrap();
 

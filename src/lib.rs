@@ -3,7 +3,6 @@ mod error;
 mod http;
 mod oidc;
 mod pkce;
-mod provider;
 mod providers;
 mod request;
 mod state;
@@ -13,7 +12,6 @@ mod tokens;
 pub use client::OAuth2Client;
 pub use error::Error;
 pub use http::{HttpClient, HttpRequest, HttpResponse};
-pub use provider::{OAuthProvider, PkceRequirement};
 pub use tokens::OAuth2Tokens;
 
 // Utilities

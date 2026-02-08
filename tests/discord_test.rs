@@ -1,33 +1,8 @@
 mod common;
-#[path = "oauth2_flow_test.rs"]
-#[macro_use]
-mod oauth2_flow_test;
-
-#[cfg(feature = "discord")]
-mod discord_flow_with_pkce {
-    use arctic_oauth::Discord;
-
-    provider_flow_tests! {
-        provider_name: "Discord (with PKCE)",
-        make_provider: |mock_url| {
-            Discord::with_endpoints(
-                "client-id",
-                Some("client-secret".into()),
-                "http://localhost/callback",
-                &format!("{mock_url}/authorize"),
-                &format!("{mock_url}/token"),
-                Some(&format!("{mock_url}/revoke")),
-            )
-        },
-        pkce: Optional,
-        supports_refresh: true,
-        supports_revocation: true,
-    }
-}
 
 #[cfg(feature = "discord")]
 mod discord_extra {
-    use arctic_oauth::{Discord, OAuthProvider, generate_code_verifier};
+    use arctic_oauth::{Discord, generate_code_verifier};
 
     #[tokio::test]
     async fn flow_without_pkce() {
@@ -102,12 +77,6 @@ mod discord_extra {
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
         assert!(!pairs.iter().any(|(k, _)| k == "code_challenge"));
         assert!(!pairs.iter().any(|(k, _)| k == "code_challenge_method"));
-    }
-
-    #[test]
-    fn supports_revocation() {
-        let discord = Discord::new("cid", Some("secret".into()), "http://localhost/callback");
-        assert!(discord.supports_token_revocation());
     }
 
     #[tokio::test]

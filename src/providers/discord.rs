@@ -2,7 +2,6 @@ use crate::client::OAuth2Client;
 use crate::error::Error;
 use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
-use crate::provider::{OAuthProvider, PkceRequirement};
 use crate::tokens::OAuth2Tokens;
 
 const AUTHORIZATION_ENDPOINT: &str = "https://discord.com/oauth2/authorize";
@@ -52,16 +51,12 @@ impl Discord {
     }
 }
 
-impl OAuthProvider for Discord {
-    fn name(&self) -> &'static str {
+impl Discord {
+    pub fn name(&self) -> &'static str {
         "Discord"
     }
 
-    fn pkce_requirement(&self) -> PkceRequirement {
-        PkceRequirement::Optional
-    }
-
-    fn authorization_url(
+    pub fn authorization_url(
         &self,
         state: &str,
         scopes: &[&str],
@@ -83,7 +78,7 @@ impl OAuthProvider for Discord {
         }
     }
 
-    async fn validate_authorization_code(
+    pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
         code: &str,
@@ -94,7 +89,7 @@ impl OAuthProvider for Discord {
             .await
     }
 
-    async fn refresh_access_token(
+    pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
         refresh_token: &str,
@@ -104,11 +99,7 @@ impl OAuthProvider for Discord {
             .await
     }
 
-    fn supports_token_revocation(&self) -> bool {
-        true
-    }
-
-    async fn revoke_token(
+    pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
         token: &str,
@@ -208,18 +199,6 @@ mod tests {
     fn name_returns_discord() {
         let discord = Discord::new("cid", Some("secret".into()), "https://app/cb");
         assert_eq!(discord.name(), "Discord");
-    }
-
-    #[test]
-    fn pkce_requirement_is_optional() {
-        let discord = Discord::new("cid", Some("secret".into()), "https://app/cb");
-        assert_eq!(discord.pkce_requirement(), PkceRequirement::Optional);
-    }
-
-    #[test]
-    fn supports_token_revocation_returns_true() {
-        let discord = Discord::new("cid", Some("secret".into()), "https://app/cb");
-        assert!(discord.supports_token_revocation());
     }
 
     #[test]

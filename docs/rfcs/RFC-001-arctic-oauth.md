@@ -1,7 +1,11 @@
 # RFC-001: arctic-oauth v0.1.0
 
-**Status**: Draft
+**Status**: Superseded in part
 **Date**: 2026-02-07
+
+> Note: The provider API strategy in this RFC has been superseded by
+> `RFC-002-provider-specific-api.md`, which removes the shared provider trait
+> in favor of provider-specific public APIs.
 
 ## Summary
 

@@ -1,54 +1,19 @@
 mod common;
-#[path = "oauth2_flow_test.rs"]
-#[macro_use]
-mod oauth2_flow_test;
-
-#[cfg(feature = "google")]
-mod google_flow {
-    use arctic_oauth::Google;
-
-    provider_flow_tests! {
-        provider_name: "Google",
-        make_provider: |mock_url| {
-            Google::with_endpoints(
-                "client-id",
-                "client-secret",
-                "http://localhost/callback",
-                &format!("{mock_url}/authorize"),
-                &format!("{mock_url}/token"),
-                Some(&format!("{mock_url}/revoke")),
-            )
-        },
-        pkce: Required,
-        supports_refresh: true,
-        supports_revocation: true,
-    }
-}
 
 #[cfg(feature = "google")]
 mod google_extra {
-    use arctic_oauth::{Google, OAuthProvider};
+    use arctic_oauth::Google;
 
     #[test]
     fn authorization_url_requires_pkce() {
         let google = Google::new("cid", "secret", "http://localhost/callback");
-        let result = google.authorization_url("state", &["openid"], None);
-        assert!(
-            result.is_err(),
-            "Google should require PKCE (code_verifier)"
-        );
+        let _url = google.authorization_url("state", &["openid"], "verifier");
     }
 
     #[test]
     fn authorization_url_includes_scope_and_redirect() {
         let google = Google::new("cid", "secret", "http://localhost/callback");
-        let url = google
-            .authorization_url(
-                "state123",
-                &["openid", "email", "profile"],
-                Some("verifier"),
-            )
-            .unwrap();
+        let url = google.authorization_url("state123", &["openid", "email", "profile"], "verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
         assert!(pairs.contains(&("scope".into(), "openid email profile".into())));

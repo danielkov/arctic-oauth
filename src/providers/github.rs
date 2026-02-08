@@ -1,6 +1,5 @@
 use crate::error::Error;
 use crate::http::HttpClient;
-use crate::provider::{OAuthProvider, PkceRequirement};
 use crate::request::{create_oauth2_request, encode_basic_credentials};
 use crate::tokens::OAuth2Tokens;
 
@@ -50,25 +49,12 @@ impl GitHub {
     }
 }
 
-impl OAuthProvider for GitHub {
-    fn name(&self) -> &'static str {
+impl GitHub {
+    pub fn name(&self) -> &'static str {
         "GitHub"
     }
 
-    fn pkce_requirement(&self) -> PkceRequirement {
-        PkceRequirement::None
-    }
-
-    fn authorization_url(
-        &self,
-        state: &str,
-        scopes: &[&str],
-        code_verifier: Option<&str>,
-    ) -> Result<url::Url, Error> {
-        if code_verifier.is_some() {
-            return Err(Error::UnexpectedResponse { status: 400 });
-        }
-
+    pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
 
@@ -87,17 +73,14 @@ impl OAuthProvider for GitHub {
             }
         }
 
-        Ok(url)
+        url
     }
 
-    async fn validate_authorization_code(
+    pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
         code: &str,
-        code_verifier: Option<&str>,
     ) -> Result<OAuth2Tokens, Error> {
-        let _ = code_verifier; // GitHub does not support PKCE
-
         let mut body = vec![
             ("grant_type".to_string(), "authorization_code".to_string()),
             ("code".to_string(), code.to_string()),
@@ -168,14 +151,6 @@ impl OAuthProvider for GitHub {
             }
             status => Err(Error::UnexpectedResponse { status }),
         }
-    }
-
-    async fn refresh_access_token(
-        &self,
-        _http_client: &(impl HttpClient + ?Sized),
-        _refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
-        Err(Error::UnexpectedResponse { status: 501 })
     }
 }
 
@@ -255,30 +230,9 @@ mod tests {
     }
 
     #[test]
-    fn pkce_requirement_is_none() {
-        let github = GitHub::new("cid", "secret", None);
-        assert_eq!(github.pkce_requirement(), PkceRequirement::None);
-    }
-
-    #[test]
-    fn supports_token_revocation_returns_false() {
-        let github = GitHub::new("cid", "secret", None);
-        assert!(!github.supports_token_revocation());
-    }
-
-    #[test]
-    fn authorization_url_errors_with_code_verifier() {
-        let github = GitHub::new("cid", "secret", None);
-        let result = github.authorization_url("state", &[], Some("verifier"));
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn authorization_url_builds_correct_params() {
         let github = GitHub::new("cid", "secret", Some("https://app/cb".into()));
-        let url = github
-            .authorization_url("state123", &["repo", "user"], None)
-            .unwrap();
+        let url = github.authorization_url("state123", &["repo", "user"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
         assert!(pairs.contains(&("response_type".into(), "code".into())));
@@ -291,7 +245,7 @@ mod tests {
     #[test]
     fn authorization_url_omits_scope_when_empty() {
         let github = GitHub::new("cid", "secret", None);
-        let url = github.authorization_url("state123", &[], None).unwrap();
+        let url = github.authorization_url("state123", &[]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
         assert!(!pairs.iter().any(|(k, _)| k == "scope"));
@@ -300,9 +254,7 @@ mod tests {
     #[test]
     fn authorization_url_omits_redirect_uri_when_none() {
         let github = GitHub::new("cid", "secret", None);
-        let url = github
-            .authorization_url("state123", &["repo"], None)
-            .unwrap();
+        let url = github.authorization_url("state123", &["repo"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
         assert!(!pairs.iter().any(|(k, _)| k == "redirect_uri"));
@@ -328,7 +280,7 @@ mod tests {
         }]);
 
         let tokens = github
-            .validate_authorization_code(&mock, "auth-code", None)
+            .validate_authorization_code(&mock, "auth-code")
             .await
             .unwrap();
 
@@ -368,7 +320,7 @@ mod tests {
         }]);
 
         github
-            .validate_authorization_code(&mock, "auth-code", None)
+            .validate_authorization_code(&mock, "auth-code")
             .await
             .unwrap();
 
@@ -396,7 +348,7 @@ mod tests {
         }]);
 
         let err = github
-            .validate_authorization_code(&mock, "bad-code", None)
+            .validate_authorization_code(&mock, "bad-code")
             .await
             .unwrap_err();
 
@@ -433,7 +385,7 @@ mod tests {
         }]);
 
         let err = github
-            .validate_authorization_code(&mock, "code", None)
+            .validate_authorization_code(&mock, "code")
             .await
             .unwrap_err();
 
@@ -461,23 +413,10 @@ mod tests {
         }]);
 
         let err = github
-            .validate_authorization_code(&mock, "code", None)
+            .validate_authorization_code(&mock, "code")
             .await
             .unwrap_err();
 
         assert!(matches!(err, Error::UnexpectedResponse { status: 500 }));
-    }
-
-    #[tokio::test]
-    async fn refresh_access_token_returns_error() {
-        let github = GitHub::new("cid", "secret", None);
-        let mock = MockHttpClient::new(vec![]);
-
-        let err = github
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap_err();
-
-        assert!(matches!(err, Error::UnexpectedResponse { status: 501 }));
     }
 }
