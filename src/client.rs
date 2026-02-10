@@ -84,7 +84,7 @@ impl OAuth2Client {
     /// Exchange an authorization code for tokens.
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
+        http_client: &impl HttpClient,
         token_endpoint: &str,
         code: &str,
         code_verifier: Option<&str>,
@@ -121,7 +121,7 @@ impl OAuth2Client {
     /// Refresh an access token.
     pub async fn refresh_access_token(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
+        http_client: &impl HttpClient,
         token_endpoint: &str,
         refresh_token: &str,
         scopes: &[&str],
@@ -154,7 +154,7 @@ impl OAuth2Client {
     /// Revoke a token (RFC 7009).
     pub async fn revoke_token(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
+        http_client: &impl HttpClient,
         revocation_endpoint: &str,
         token: &str,
     ) -> Result<(), Error> {

@@ -6,6 +6,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://www.reddit.com/api/v1/authorize";
 const TOKEN_ENDPOINT: &str = "https://www.reddit.com/api/v1/access_token";
 
+/// Configuration for creating a [`Reddit`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Reddit::new`] which uses the built-in default client.
+pub struct RedditOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Reddit](https://www.reddit.com/dev/api/oauth).
 ///
 /// Reddit uses standard OAuth 2.0 authorization code flow without PKCE.
@@ -34,7 +46,7 @@ const TOKEN_ENDPOINT: &str = "https://www.reddit.com/api/v1/access_token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Reddit, ReqwestClient, generate_state};
+/// use arctic_oauth::{Reddit, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let provider = Reddit::new(
@@ -48,27 +60,51 @@ const TOKEN_ENDPOINT: &str = "https://www.reddit.com/api/v1/access_token";
 /// let url = provider.authorization_url(&state, &["identity", "read"]);
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = provider
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = provider
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Reddit {
+pub struct Reddit<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Reddit {
-    /// Creates a new Reddit OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Reddit<'a, H> {
+    /// Creates a Reddit client from a [`RedditOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Reddit::new`] instead.
+    pub fn from_options(options: RedditOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Reddit<'static, reqwest::Client> {
+    /// Creates a new Reddit OAuth 2.0 client using the default HTTP client.
+    ///
+    /// The endpoints are automatically set to production values.
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Reddit::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -93,62 +129,16 @@ impl Reddit {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+        Self::from_options(RedditOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Reddit {
-    /// Creates a Reddit client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Reddit;
-    ///
-    /// let provider = Reddit::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Reddit {
+impl<'a, H: HttpClient> Reddit<'a, H> {
     /// Returns the provider name (`"Reddit"`).
     pub fn name(&self) -> &'static str {
         "Reddit"
@@ -164,17 +154,6 @@ impl Reddit {
     ///
     /// * `state` - A CSRF token. Use [`generate_state`](crate::generate_state) to create one.
     /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["identity", "read"]`).
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use arctic_oauth::{Reddit, generate_state};
-    ///
-    /// let provider = Reddit::new("client-id", "client-secret", "https://example.com/cb");
-    /// let state = generate_state();
-    ///
-    /// let url = provider.authorization_url(&state, &["identity", "read"]);
-    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         self.client
             .create_authorization_url(&self.authorization_endpoint, state, scopes)
@@ -187,38 +166,15 @@ impl Reddit {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
     ///
     /// Returns [`Error::OAuthRequest`] if Reddit rejects the code, or
     /// [`Error::Http`] on network failure.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use arctic_oauth::{Reddit, ReqwestClient};
-    /// # async fn example() -> Result<(), arctic_oauth::Error> {
-    /// let provider = Reddit::new("client-id", "client-secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
-    ///
-    /// let tokens = provider
-    ///     .validate_authorization_code(&http, "the-auth-code")
-    ///     .await?;
-    ///
-    /// println!("Access token: {}", tokens.access_token()?);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, None)
+            .validate_authorization_code(self.http_client, &self.token_endpoint, code, None)
             .await
     }
 
@@ -229,37 +185,15 @@ impl Reddit {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
     ///
     /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
     /// [`Error::Http`] on network failure.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use arctic_oauth::{Reddit, ReqwestClient};
-    /// # async fn example() -> Result<(), arctic_oauth::Error> {
-    /// let provider = Reddit::new("client-id", "client-secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
-    ///
-    /// let new_tokens = provider
-    ///     .refresh_access_token(&http, "stored-refresh-token")
-    ///     .await?;
-    ///
-    /// println!("New access token: {}", new_tokens.access_token()?);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 }
@@ -305,35 +239,34 @@ mod tests {
             .collect()
     }
 
+    fn make_reddit(http_client: &MockHttpClient) -> Reddit<'_, MockHttpClient> {
+        Reddit::from_options(RedditOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let reddit = Reddit::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let reddit = make_reddit(&mock);
         assert_eq!(reddit.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(reddit.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
-    fn with_endpoints_overrides_urls() {
-        let reddit = Reddit::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
-        assert_eq!(reddit.authorization_endpoint, "https://mock/authorize");
-        assert_eq!(reddit.token_endpoint, "https://mock/token");
-    }
-
-    #[test]
     fn name_returns_correct_name() {
-        let reddit = Reddit::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let reddit = make_reddit(&mock);
         assert_eq!(reddit.name(), "Reddit");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let reddit = Reddit::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let reddit = make_reddit(&mock);
         let url = reddit.authorization_url("state123", &["read", "identity"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -347,13 +280,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let reddit = Reddit::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -363,9 +289,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let reddit = make_reddit(&mock);
 
         let tokens = reddit
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
@@ -373,7 +300,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "authorization_code".into())));
@@ -383,13 +310,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let reddit = Reddit::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -398,17 +318,15 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let reddit = make_reddit(&mock);
 
-        let tokens = reddit
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = reddit.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "refresh_token".into())));

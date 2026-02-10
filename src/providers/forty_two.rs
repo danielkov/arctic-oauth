@@ -6,6 +6,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://api.intra.42.fr/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.intra.42.fr/oauth/token";
 
+/// Configuration for creating a [`FortyTwo`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`FortyTwo::new`] which uses the built-in default client.
+pub struct FortyTwoOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [42 (École 42)](https://api.intra.42.fr/apidoc).
 ///
 /// 42 uses the standard authorization code flow without requiring PKCE.
@@ -32,7 +44,7 @@ const TOKEN_ENDPOINT: &str = "https://api.intra.42.fr/oauth/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{FortyTwo, ReqwestClient, generate_state};
+/// use arctic_oauth::{FortyTwo, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let forty_two = FortyTwo::new(
@@ -47,24 +59,46 @@ const TOKEN_ENDPOINT: &str = "https://api.intra.42.fr/oauth/token";
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = forty_two
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 /// # Ok(())
 /// # }
 /// ```
-pub struct FortyTwo {
+pub struct FortyTwo<'a, H: HttpClient> {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl FortyTwo {
-    /// Creates a new 42 OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> FortyTwo<'a, H> {
+    /// Creates a 42 client from a [`FortyTwoOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`FortyTwo::new`] instead.
+    pub fn from_options(options: FortyTwoOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            redirect_uri: options.redirect_uri,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl FortyTwo<'static, reqwest::Client> {
+    /// Creates a new 42 OAuth 2.0 client using the default HTTP client.
+    ///
+    /// The endpoints are automatically set to production values.
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`FortyTwo::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -89,58 +123,16 @@ impl FortyTwo {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::from_options(FortyTwoOptions {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             redirect_uri: redirect_uri.into(),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl FortyTwo {
-    /// Creates a 42 client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::FortyTwo;
-    ///
-    /// let forty_two = FortyTwo::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client_id: client_id.into(),
-            client_secret: client_secret.into(),
-            redirect_uri: redirect_uri.into(),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl FortyTwo {
+impl<'a, H: HttpClient> FortyTwo<'a, H> {
     /// Returns the provider name (`"42"`).
     pub fn name(&self) -> &'static str {
         "42"
@@ -196,8 +188,6 @@ impl FortyTwo {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -208,24 +198,19 @@ impl FortyTwo {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{FortyTwo, ReqwestClient};
+    /// # use arctic_oauth::FortyTwo;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let forty_two = FortyTwo::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = forty_two
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         let body = vec![
             ("grant_type".to_string(), "authorization_code".to_string()),
             ("code".to_string(), code.to_string()),
@@ -235,7 +220,7 @@ impl FortyTwo {
         ];
 
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 }
 
@@ -288,22 +273,34 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_forty_two(http_client: &MockHttpClient) -> FortyTwo<'_, MockHttpClient> {
+        FortyTwo::from_options(FortyTwoOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let provider = FortyTwo::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_forty_two(&mock);
         assert_eq!(provider.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(provider.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
     fn name_returns_42() {
-        let provider = FortyTwo::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_forty_two(&mock);
         assert_eq!(provider.name(), "42");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let provider = FortyTwo::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_forty_two(&mock);
         let url = provider.authorization_url("state123", &["public", "projects"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -316,7 +313,8 @@ mod tests {
 
     #[test]
     fn authorization_url_omits_scope_when_empty() {
-        let provider = FortyTwo::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_forty_two(&mock);
         let url = provider.authorization_url("state123", &[]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -325,13 +323,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_body_credentials() {
-        let provider = FortyTwo::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -340,9 +331,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let provider = make_forty_two(&mock);
 
         let tokens = provider
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
@@ -350,7 +342,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         // No Authorization header (body credentials, not Basic Auth)
         assert!(get_header(&requests[0], "Authorization").is_none());

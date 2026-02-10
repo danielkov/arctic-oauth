@@ -6,6 +6,36 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://dribbble.com/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://dribbble.com/oauth/token";
 
+/// Configuration for creating a [`Dribbble`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Dribbble::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Dribbble, DribbbleOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let dribbble = Dribbble::from_options(DribbbleOptions {
+///     client_id: "your-client-id".into(),
+///     client_secret: "your-client-secret".into(),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct DribbbleOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Dribbble](https://developer.dribbble.com/v2/oauth/).
 ///
 /// Dribbble uses the standard authorization code flow without requiring PKCE.
@@ -32,7 +62,7 @@ const TOKEN_ENDPOINT: &str = "https://dribbble.com/oauth/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Dribbble, ReqwestClient, generate_state};
+/// use arctic_oauth::{Dribbble, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let dribbble = Dribbble::new(
@@ -47,24 +77,59 @@ const TOKEN_ENDPOINT: &str = "https://dribbble.com/oauth/token";
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = dribbble
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 /// # Ok(())
 /// # }
 /// ```
-pub struct Dribbble {
+pub struct Dribbble<'a, H: HttpClient> {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Dribbble {
-    /// Creates a new Dribbble OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Dribbble<'a, H> {
+    /// Creates a Dribbble client from a [`DribbbleOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Dribbble::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Dribbble, DribbbleOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let dribbble = Dribbble::from_options(DribbbleOptions {
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: "your-client-secret".into(),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: DribbbleOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            redirect_uri: options.redirect_uri,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Dribbble<'static, reqwest::Client> {
+    /// Creates a new Dribbble OAuth 2.0 client configured with production endpoints using the default HTTP client.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Dribbble::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -89,58 +154,16 @@ impl Dribbble {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::from_options(DribbbleOptions {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             redirect_uri: redirect_uri.into(),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Dribbble {
-    /// Creates a Dribbble client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Dribbble;
-    ///
-    /// let dribbble = Dribbble::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client_id: client_id.into(),
-            client_secret: client_secret.into(),
-            redirect_uri: redirect_uri.into(),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Dribbble {
+impl<'a, H: HttpClient> Dribbble<'a, H> {
     /// Returns the provider name (`"Dribbble"`).
     pub fn name(&self) -> &'static str {
         "Dribbble"
@@ -196,8 +219,6 @@ impl Dribbble {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -208,24 +229,19 @@ impl Dribbble {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Dribbble, ReqwestClient};
+    /// # use arctic_oauth::Dribbble;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let dribbble = Dribbble::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = dribbble
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         let body = vec![
             ("grant_type".to_string(), "authorization_code".to_string()),
             ("code".to_string(), code.to_string()),
@@ -235,7 +251,7 @@ impl Dribbble {
         ];
 
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 }
 
@@ -288,22 +304,34 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_dribbble(http_client: &MockHttpClient) -> Dribbble<'_, MockHttpClient> {
+        Dribbble::from_options(DribbbleOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let provider = Dribbble::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_dribbble(&mock);
         assert_eq!(provider.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(provider.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
     fn name_returns_dribbble() {
-        let provider = Dribbble::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_dribbble(&mock);
         assert_eq!(provider.name(), "Dribbble");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let provider = Dribbble::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_dribbble(&mock);
         let url = provider.authorization_url("state123", &["public", "upload"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -316,7 +344,8 @@ mod tests {
 
     #[test]
     fn authorization_url_omits_scope_when_empty() {
-        let provider = Dribbble::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_dribbble(&mock);
         let url = provider.authorization_url("state123", &[]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -325,13 +354,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_body_credentials() {
-        let provider = Dribbble::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -340,9 +362,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let provider = make_dribbble(&mock);
 
         let tokens = provider
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
@@ -350,7 +373,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, "https://dribbble.com/oauth/token");
 
         // No Authorization header (body credentials, not Basic Auth)
         assert!(get_header(&requests[0], "Authorization").is_none());

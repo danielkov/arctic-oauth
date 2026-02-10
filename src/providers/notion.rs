@@ -6,6 +6,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://api.notion.com/v1/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.notion.com/v1/oauth/token";
 
+/// Configuration for creating a [`Notion`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Notion::new`] which uses the built-in default client.
+pub struct NotionOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Notion](https://developers.notion.com/docs/authorization).
 ///
 /// Notion does not require PKCE and does not use OAuth scopes. This client supports
@@ -32,7 +44,7 @@ const TOKEN_ENDPOINT: &str = "https://api.notion.com/v1/oauth/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Notion, ReqwestClient, generate_state};
+/// use arctic_oauth::{Notion, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let notion = Notion::new(
@@ -47,22 +59,42 @@ const TOKEN_ENDPOINT: &str = "https://api.notion.com/v1/oauth/token";
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = notion
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 /// # Ok(())
 /// # }
 /// ```
-pub struct Notion {
+pub struct Notion<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Notion {
-    /// Creates a new Notion OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Notion<'a, H> {
+    /// Creates a Notion client from a [`NotionOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Notion::new`] instead.
+    pub fn from_options(options: NotionOptions<'a, H>) -> Self {
+        Self {
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                Some(options.redirect_uri),
+            ),
+            http_client: options.http_client,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Notion<'static, reqwest::Client> {
+    /// Creates a new Notion OAuth 2.0 client using the default HTTP client.
     ///
     /// # Arguments
     ///
@@ -87,62 +119,16 @@ impl Notion {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+        Self::from_options(NotionOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Notion {
-    /// Creates a Notion client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Notion;
-    ///
-    /// let notion = Notion::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Notion {
+impl<'a, H: HttpClient> Notion<'a, H> {
     /// Returns the provider name (`"Notion"`).
     pub fn name(&self) -> &'static str {
         "Notion"
@@ -173,9 +159,9 @@ impl Notion {
     /// assert!(url.as_str().starts_with("https://api.notion.com/"));
     /// ```
     pub fn authorization_url(&self, state: &str) -> url::Url {
-        let mut url = self
-            .client
-            .create_authorization_url(&self.authorization_endpoint, state, &[]);
+        let mut url =
+            self.client
+                .create_authorization_url(&self.authorization_endpoint, state, &[]);
         url.query_pairs_mut().append_pair("owner", "user");
         url
     }
@@ -188,8 +174,6 @@ impl Notion {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -200,26 +184,21 @@ impl Notion {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Notion, ReqwestClient};
+    /// # use arctic_oauth::Notion;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let notion = Notion::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = notion
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, None)
+            .validate_authorization_code(self.http_client, &self.token_endpoint, code, None)
             .await
     }
 }
@@ -267,22 +246,34 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_notion(http_client: &MockHttpClient) -> Notion<'_, MockHttpClient> {
+        Notion::from_options(NotionOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let notion = Notion::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let notion = make_notion(&mock);
         assert_eq!(notion.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(notion.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
     fn name_returns_notion() {
-        let notion = Notion::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let notion = make_notion(&mock);
         assert_eq!(notion.name(), "Notion");
     }
 
     #[test]
     fn authorization_url_includes_owner_user() {
-        let notion = Notion::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let notion = make_notion(&mock);
         let url = notion.authorization_url("state123");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -296,13 +287,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let notion = Notion::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -311,16 +295,17 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let notion = make_notion(&mock);
 
         let tokens = notion
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "notion-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, "https://api.notion.com/v1/oauth/token");
         assert!(get_header(&requests[0], "Authorization").is_some());
     }
 }

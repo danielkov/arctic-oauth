@@ -7,6 +7,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://myanimelist.net/v1/oauth2/authorize";
 const TOKEN_ENDPOINT: &str = "https://myanimelist.net/v1/oauth2/token";
 
+/// Configuration for creating a [`MyAnimeList`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`MyAnimeList::new`] which uses the built-in default client.
+pub struct MyAnimeListOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: Option<String>,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [MyAnimeList](https://myanimelist.net/apiconfig/references/authorization).
 ///
 /// MyAnimeList requires PKCE with the Plain challenge method (not S256) on all authorization
@@ -36,7 +48,7 @@ const TOKEN_ENDPOINT: &str = "https://myanimelist.net/v1/oauth2/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{MyAnimeList, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{MyAnimeList, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let myanimelist = MyAnimeList::new(
@@ -52,27 +64,47 @@ const TOKEN_ENDPOINT: &str = "https://myanimelist.net/v1/oauth2/token";
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = myanimelist
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = myanimelist
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct MyAnimeList {
+pub struct MyAnimeList<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl MyAnimeList {
-    /// Creates a new MyAnimeList OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> MyAnimeList<'a, H> {
+    /// Creates a MyAnimeList client from a [`MyAnimeListOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`MyAnimeList::new`] instead.
+    pub fn from_options(options: MyAnimeListOptions<'a, H>) -> Self {
+        Self {
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                options.redirect_uri,
+            ),
+            http_client: options.http_client,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl MyAnimeList<'static, reqwest::Client> {
+    /// Creates a new MyAnimeList OAuth 2.0 client using the default HTTP client.
     ///
     /// # Arguments
     ///
@@ -105,54 +137,16 @@ impl MyAnimeList {
         client_secret: impl Into<String>,
         redirect_uri: Option<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, Some(client_secret.into()), redirect_uri),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+        Self::from_options(MyAnimeListOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri,
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl MyAnimeList {
-    /// Creates a MyAnimeList client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::MyAnimeList;
-    ///
-    /// let myanimelist = MyAnimeList::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     Some("http://localhost/callback".to_string()),
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: Option<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, Some(client_secret.into()), redirect_uri),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl MyAnimeList {
+impl<'a, H: HttpClient> MyAnimeList<'a, H> {
     /// Returns the provider name (`"MyAnimeList"`).
     pub fn name(&self) -> &'static str {
         "MyAnimeList"
@@ -202,8 +196,6 @@ impl MyAnimeList {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -215,13 +207,12 @@ impl MyAnimeList {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{MyAnimeList, ReqwestClient};
+    /// # use arctic_oauth::MyAnimeList;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let myanimelist = MyAnimeList::new("client-id", "secret", Some("https://example.com/cb".to_string()));
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = myanimelist
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -230,13 +221,12 @@ impl MyAnimeList {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
             .validate_authorization_code(
-                http_client,
+                self.http_client,
                 &self.token_endpoint,
                 code,
                 Some(code_verifier),
@@ -252,7 +242,6 @@ impl MyAnimeList {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -263,26 +252,21 @@ impl MyAnimeList {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{MyAnimeList, ReqwestClient};
+    /// # use arctic_oauth::MyAnimeList;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let myanimelist = MyAnimeList::new("client-id", "secret", Some("https://example.com/cb".to_string()));
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = myanimelist
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 }
@@ -336,28 +320,46 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_myanimelist(http_client: &MockHttpClient) -> MyAnimeList<'_, MockHttpClient> {
+        MyAnimeList::from_options(MyAnimeListOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: Some("https://app/cb".into()),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let provider = MyAnimeList::new("cid", "secret", Some("https://app/cb".into()));
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_myanimelist(&mock);
         assert_eq!(provider.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(provider.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
     fn new_with_no_redirect_uri() {
-        let provider = MyAnimeList::new("cid", "secret", None);
+        let mock = MockHttpClient::new(vec![]);
+        let provider = MyAnimeList::from_options(MyAnimeListOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: None,
+            http_client: &mock,
+        });
         assert_eq!(provider.name(), "MyAnimeList");
     }
 
     #[test]
     fn name_returns_myanimelist() {
-        let provider = MyAnimeList::new("cid", "secret", Some("https://app/cb".into()));
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_myanimelist(&mock);
         assert_eq!(provider.name(), "MyAnimeList");
     }
 
     #[test]
     fn authorization_url_uses_plain_pkce() {
-        let provider = MyAnimeList::new("cid", "secret", Some("https://app/cb".into()));
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_myanimelist(&mock);
         let url = provider.authorization_url("state123", "my-plain-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -374,7 +376,13 @@ mod tests {
 
     #[test]
     fn authorization_url_without_redirect_uri() {
-        let provider = MyAnimeList::new("cid", "secret", None);
+        let mock = MockHttpClient::new(vec![]);
+        let provider = MyAnimeList::from_options(MyAnimeListOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: None,
+            http_client: &mock,
+        });
         let url = provider.authorization_url("state123", "verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -384,13 +392,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_uses_basic_auth() {
-        let provider = MyAnimeList::with_endpoints(
-            "cid",
-            "secret",
-            Some("https://app/cb".into()),
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -399,16 +400,17 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let provider = make_myanimelist(&mock);
 
         let tokens = provider
-            .validate_authorization_code(&mock, "auth-code", "my-verifier")
+            .validate_authorization_code("auth-code", "my-verifier")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "mal-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
         // Pattern A: Basic Auth
         assert!(get_header(&requests[0], "Authorization").is_some());
 
@@ -421,13 +423,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_uses_basic_auth() {
-        let provider = MyAnimeList::with_endpoints(
-            "cid",
-            "secret",
-            Some("https://app/cb".into()),
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -436,11 +431,9 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let provider = make_myanimelist(&mock);
 
-        let tokens = provider
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = provider.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 

@@ -9,6 +9,36 @@ const AUTHORIZATION_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/au
 const TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const REVOCATION_ENDPOINT: &str = "https://oauth2.googleapis.com/revoke";
 
+/// Configuration for creating a [`Google`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Google::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Google, GoogleOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let google = Google::from_options(GoogleOptions {
+///     client_id: "your-client-id".into(),
+///     client_secret: "your-client-secret".into(),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct GoogleOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Google](https://developers.google.com/identity/protocols/oauth2).
 ///
 /// Google requires PKCE with the S256 challenge method on all authorization requests.
@@ -36,7 +66,7 @@ const REVOCATION_ENDPOINT: &str = "https://oauth2.googleapis.com/revoke";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Google, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Google, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let google = Google::new(
@@ -52,31 +82,69 @@ const REVOCATION_ENDPOINT: &str = "https://oauth2.googleapis.com/revoke";
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = google
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = google
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// google.revoke_token(&http, tokens.access_token()?).await?;
+/// google.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Google {
+pub struct Google<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl Google {
-    /// Creates a new Google OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Google<'a, H> {
+    /// Creates a Google client from a [`GoogleOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Google::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Google, GoogleOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let google = Google::from_options(GoogleOptions {
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: "your-client-secret".into(),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: GoogleOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Google<'static, reqwest::Client> {
+    /// Creates a new Google OAuth 2.0 client using the default HTTP client.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Google::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -101,68 +169,16 @@ impl Google {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
-        }
+        Self::from_options(GoogleOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Google {
-    /// Creates a Google client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Google;
-    ///
-    /// let google = Google::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    ///     Some("http://localhost:8080/revoke"),
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-        revocation_endpoint: Option<&str>,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-            revocation_endpoint: revocation_endpoint
-                .unwrap_or(REVOCATION_ENDPOINT)
-                .to_string(),
-        }
-    }
-}
-
-impl Google {
+impl<'a, H: HttpClient> Google<'a, H> {
     /// Returns the provider name (`"Google"`).
     pub fn name(&self) -> &'static str {
         "Google"
@@ -212,8 +228,6 @@ impl Google {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -225,13 +239,12 @@ impl Google {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Google, ReqwestClient};
+    /// # use arctic_oauth::Google;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let google = Google::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = google
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -240,13 +253,12 @@ impl Google {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
             .validate_authorization_code(
-                http_client,
+                self.http_client,
                 &self.token_endpoint,
                 code,
                 Some(code_verifier),
@@ -262,7 +274,6 @@ impl Google {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -273,26 +284,21 @@ impl Google {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Google, ReqwestClient};
+    /// # use arctic_oauth::Google;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let google = Google::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = google
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 
@@ -305,7 +311,6 @@ impl Google {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token or refresh token to revoke.
     ///
     /// # Errors
@@ -316,24 +321,19 @@ impl Google {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Google, ReqwestClient};
+    /// # use arctic_oauth::Google;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let google = Google::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
-    /// google.revoke_token(&http, "token-to-revoke").await?;
+    /// google.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         let body = vec![("token".to_string(), token.to_string())];
         let request = create_oauth2_request(&self.revocation_endpoint, &body);
 
-        let response = http_client.send(request).await?;
+        let response = self.http_client.send(request).await?;
 
         match response.status {
             200 => Ok(()),
@@ -391,51 +391,35 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_google(http_client: &MockHttpClient) -> Google<'_, MockHttpClient> {
+        Google::from_options(GoogleOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let google = Google::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let google = make_google(&mock);
         assert_eq!(google.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(google.token_endpoint, TOKEN_ENDPOINT);
         assert_eq!(google.revocation_endpoint, REVOCATION_ENDPOINT);
     }
 
     #[test]
-    fn with_endpoints_overrides_urls() {
-        let google = Google::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
-        assert_eq!(google.authorization_endpoint, "https://mock/authorize");
-        assert_eq!(google.token_endpoint, "https://mock/token");
-        assert_eq!(google.revocation_endpoint, "https://mock/revoke");
-    }
-
-    #[test]
-    fn with_endpoints_defaults_revocation() {
-        let google = Google::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
-        assert_eq!(google.revocation_endpoint, REVOCATION_ENDPOINT);
-    }
-
-    #[test]
     fn name_returns_google() {
-        let google = Google::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let google = make_google(&mock);
         assert_eq!(google.name(), "Google");
     }
 
     #[test]
     fn authorization_url_includes_pkce_params() {
-        let google = Google::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let google = make_google(&mock);
         let url = google.authorization_url("state123", &["openid", "email"], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -450,14 +434,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let google = Google::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -467,9 +443,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let google = make_google(&mock);
 
         let tokens = google
-            .validate_authorization_code(&mock, "auth-code", "verifier")
+            .validate_authorization_code("auth-code", "verifier")
             .await
             .unwrap();
 
@@ -477,7 +454,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "authorization_code".into())));
@@ -487,14 +464,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let google = Google::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -503,17 +472,15 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let google = make_google(&mock);
 
-        let tokens = google
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = google.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "refresh_token".into())));
@@ -522,25 +489,18 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_token_sends_post_with_form_body() {
-        let google = Google::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let google = make_google(&mock);
 
-        let result = google.revoke_token(&mock, "tok-to-revoke").await;
+        let result = google.revoke_token("tok-to-revoke").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/revoke");
+        assert_eq!(requests[0].url, REVOCATION_ENDPOINT);
 
         // Google-specific: token sent in POST form body, not Basic auth
         assert!(get_header(&requests[0], "Authorization").is_none());
@@ -551,20 +511,13 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_token_non_200_returns_error() {
-        let google = Google::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 503,
             body: vec![],
         }]);
+        let google = make_google(&mock);
 
-        let result = google.revoke_token(&mock, "tok").await;
+        let result = google.revoke_token("tok").await;
         assert!(matches!(
             result,
             Err(Error::UnexpectedResponse { status: 503 })

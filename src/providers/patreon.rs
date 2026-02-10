@@ -6,6 +6,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://www.patreon.com/oauth2/authorize";
 const TOKEN_ENDPOINT: &str = "https://www.patreon.com/api/oauth2/token";
 
+/// Configuration for creating a [`Patreon`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Patreon::new`] which uses the built-in default client.
+pub struct PatreonOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Patreon](https://docs.patreon.com/#oauth).
 ///
 /// Patreon does not require PKCE for authorization requests. This client supports the standard
@@ -34,7 +46,7 @@ const TOKEN_ENDPOINT: &str = "https://www.patreon.com/api/oauth2/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Patreon, ReqwestClient, generate_state};
+/// use arctic_oauth::{Patreon, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let patreon = Patreon::new(
@@ -49,29 +61,50 @@ const TOKEN_ENDPOINT: &str = "https://www.patreon.com/api/oauth2/token";
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = patreon
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = patreon
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Patreon {
+pub struct Patreon<'a, H: HttpClient> {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
     authorization_endpoint: String,
     token_endpoint: String,
+    http_client: &'a H,
 }
 
-impl Patreon {
+impl<'a, H: HttpClient> Patreon<'a, H> {
+    /// Creates a Patreon client from a [`PatreonOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Patreon::new`] instead.
+    pub fn from_options(options: PatreonOptions<'a, H>) -> Self {
+        Self {
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            redirect_uri: options.redirect_uri,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            http_client: options.http_client,
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Patreon<'static, reqwest::Client> {
     /// Creates a new Patreon OAuth 2.0 client configured with production endpoints.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Patreon::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -96,58 +129,16 @@ impl Patreon {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::from_options(PatreonOptions {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             redirect_uri: redirect_uri.into(),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Patreon {
-    /// Creates a Patreon client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Patreon;
-    ///
-    /// let patreon = Patreon::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client_id: client_id.into(),
-            client_secret: client_secret.into(),
-            redirect_uri: redirect_uri.into(),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Patreon {
+impl<'a, H: HttpClient> Patreon<'a, H> {
     /// Returns the provider name (`"Patreon"`).
     pub fn name(&self) -> &'static str {
         "Patreon"
@@ -203,8 +194,6 @@ impl Patreon {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -215,24 +204,19 @@ impl Patreon {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Patreon, ReqwestClient};
+    /// # use arctic_oauth::Patreon;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let patreon = Patreon::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = patreon
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         let body = vec![
             ("grant_type".to_string(), "authorization_code".to_string()),
             ("code".to_string(), code.to_string()),
@@ -241,7 +225,7 @@ impl Patreon {
             ("redirect_uri".to_string(), self.redirect_uri.clone()),
         ];
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 
     /// Refreshes an expired access token using a refresh token.
@@ -252,7 +236,6 @@ impl Patreon {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -263,24 +246,19 @@ impl Patreon {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Patreon, ReqwestClient};
+    /// # use arctic_oauth::Patreon;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let patreon = Patreon::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = patreon
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         let body = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),
@@ -288,7 +266,7 @@ impl Patreon {
             ("client_secret".to_string(), self.client_secret.clone()),
         ];
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 }
 
@@ -333,6 +311,15 @@ mod tests {
             .collect()
     }
 
+    fn make_patreon(http_client: &MockHttpClient) -> Patreon<'_, MockHttpClient> {
+        Patreon::from_options(PatreonOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     fn get_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
         request
             .headers
@@ -343,20 +330,23 @@ mod tests {
 
     #[test]
     fn new_sets_production_endpoints() {
-        let provider = Patreon::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_patreon(&mock);
         assert_eq!(provider.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(provider.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
     fn name_returns_patreon() {
-        let provider = Patreon::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_patreon(&mock);
         assert_eq!(provider.name(), "Patreon");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let provider = Patreon::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_patreon(&mock);
         let url = provider.authorization_url("state123", &["identity", "campaigns"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -370,7 +360,8 @@ mod tests {
 
     #[test]
     fn authorization_url_omits_scope_when_empty() {
-        let provider = Patreon::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_patreon(&mock);
         let url = provider.authorization_url("state123", &[]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -379,13 +370,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_body_credentials() {
-        let provider = Patreon::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -395,9 +379,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let provider = make_patreon(&mock);
 
         let tokens = provider
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
@@ -405,7 +390,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
         assert!(get_header(&requests[0], "Authorization").is_none());
 
         let body = parse_form_body(&requests[0]);
@@ -418,13 +403,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_sends_body_credentials() {
-        let provider = Patreon::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -433,11 +411,9 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let provider = make_patreon(&mock);
 
-        let tokens = provider
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = provider.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 

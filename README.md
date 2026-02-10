@@ -27,9 +27,8 @@ Rust-first OAuth 2.0 authorization-code client that ports the ergonomics of the 
 
 - **Provider-aware clients.** Each provider struct encodes its production endpoints, HTTP authentication style, PKCE requirements, and spec deviations (e.g., GitHub returning OAuth errors with HTTP 200).
 - **Minimal surface area.** The crate exposes a handful of core types (`OAuth2Client`, `OAuth2Tokens`, `HttpClient`) plus utilities for PKCE, CSRF state, and ID token decoding.
-- **Bring-your-own HTTP stack.** Any async HTTP client that implements the lightweight `HttpClient` trait will work. A `reqwest` implementation is included behind the `reqwest-client` feature (enabled by default).
+- **Bring-your-own HTTP stack.** Any async HTTP client that implements the lightweight `HttpClient` trait will work. A `reqwest::Client` implementation is included behind the `reqwest-client` feature (enabled by default).
 - **Stateless by design.** No session store, clock skew, or token cache assumptions. You control persistence and verification.
-- **High test coverage.** Each module ships with unit tests, and every provider has an integration suite that drives mocked OAuth servers end-to-end.
 
 ## Feature matrix
 
@@ -55,12 +54,11 @@ cargo add arctic-oauth --features "google"
 
 Feature flags:
 
-| Flag                       | Enables                                                                                                                                      |
-| -------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
-| `reqwest-client` (default) | `ReqwestClient`, a drop-in `HttpClient` backed by `reqwest`                                                                                  |
-| `<provider>`               | Individual provider export (e.g. `google`, `github`, `discord`, `spotify`, `twitter`, etc.)                                                  |
-| `all-providers`            | Convenience flag that enables all 64 providers plus `testing`                                                                                |
-| `testing`                  | Exposes constructors like `with_endpoints` outside of tests so you can point providers at custom OAuth servers in your own integration suite |
+| Flag                       | Enables                                                                                     |
+| -------------------------- | ------------------------------------------------------------------------------------------- |
+| `reqwest-client` (default) | `impl HttpClient for reqwest::Client` plus a shared `default_client()` via `LazyLock`       |
+| `<provider>`               | Individual provider export (e.g. `google`, `github`, `discord`, `spotify`, `twitter`, etc.) |
+| `all-providers`            | Convenience flag that enables all 64 providers                                              |
 
 Each provider has its own feature flag matching its kebab-case name (e.g. `microsoft-entra-id`, `epic-games`, `my-anime-list`). See the [Supported providers](#supported-providers) section for the full list.
 
@@ -87,12 +85,25 @@ impl HttpClient for MyClient {
 }
 ```
 
+When using a custom HTTP client, construct providers via `from_options`:
+
+```rust
+use arctic_oauth::{Google, GoogleOptions};
+
+let my_client = MyClient { /* ... */ };
+let google = Google::from_options(GoogleOptions {
+    client_id: "google-client-id".into(),
+    client_secret: "google-client-secret".into(),
+    redirect_uri: "https://app.example.com/oauth/callback".into(),
+    http_client: &my_client,
+});
+```
+
 ## Quick start
 
 ```rust
 use arctic_oauth::{
-    generate_code_verifier, generate_state, decode_id_token,
-    Google, ReqwestClient,
+    generate_code_verifier, generate_state, decode_id_token, Google,
 };
 
 #[tokio::main]
@@ -114,9 +125,8 @@ async fn main() -> Result<(), arctic_oauth::Error> {
     println!("Redirect user to: {auth_url}");
 
     // 4. After the callback, exchange the authorization code for tokens
-    let http = ReqwestClient::new();
     let tokens = google
-        .validate_authorization_code(&http, "authorization-code", &code_verifier)
+        .validate_authorization_code("authorization-code", &code_verifier)
         .await?;
 
     println!("access_token = {}", tokens.access_token()?);
@@ -124,7 +134,7 @@ async fn main() -> Result<(), arctic_oauth::Error> {
     // 5. Optional helpers
     if tokens.has_refresh_token() {
         let refreshed = google
-            .refresh_access_token(&http, tokens.refresh_token()?)
+            .refresh_access_token(tokens.refresh_token()?)
             .await?;
         println!("new access_token = {}", refreshed.access_token()?);
     }
@@ -150,7 +160,7 @@ This example stores `oauth_state` and `oauth_code_verifier` in HttpOnly cookies 
 use std::sync::Arc;
 
 use arctic_oauth::{
-    generate_code_verifier, generate_state, Google, ReqwestClient,
+    generate_code_verifier, generate_state, Google,
 };
 use axum::{
     extract::{Query, State},
@@ -165,7 +175,7 @@ use serde::Deserialize;
 
 #[derive(Clone)]
 struct AppState {
-    google: Arc<Google>,
+    google: Arc<Google<'static, reqwest::Client>>,
 }
 
 #[derive(Deserialize)]
@@ -234,10 +244,9 @@ async fn callback(
         .map(|c| c.value().to_owned())
         .ok_or((StatusCode::BAD_REQUEST, "missing code verifier cookie".into()))?;
 
-    let http = ReqwestClient::new();
     let tokens = state
         .google
-        .validate_authorization_code(&http, &query.code, &code_verifier)
+        .validate_authorization_code(&query.code, &code_verifier)
         .await
         .map_err(|e| (StatusCode::BAD_GATEWAY, e.to_string()))?;
     let access_token = tokens
@@ -275,7 +284,7 @@ Same flow as Axum, but using `HttpRequest::cookie` and `HttpResponse` cookie bui
 
 ```rust
 use arctic_oauth::{
-    generate_code_verifier, generate_state, Google, ReqwestClient,
+    generate_code_verifier, generate_state, Google,
 };
 use actix_web::{
     cookie::{
@@ -289,7 +298,7 @@ use actix_web::{
 use serde::Deserialize;
 
 struct AppState {
-    google: Google,
+    google: Google<'static, reqwest::Client>,
 }
 
 #[derive(Deserialize)]
@@ -357,10 +366,9 @@ async fn callback(
         .map(|c| c.value().to_owned())
         .ok_or_else(|| actix_web::error::ErrorBadRequest("missing code verifier cookie"))?;
 
-    let http = ReqwestClient::new();
     let tokens = state
         .google
-        .validate_authorization_code(&http, &query.code, &code_verifier)
+        .validate_authorization_code(&query.code, &code_verifier)
         .await
         .map_err(actix_web::error::ErrorBadGateway)?;
     let access_token = tokens
@@ -417,11 +425,35 @@ The provider API is intentionally **provider-specific** instead of trait-based.
 
 Trade-off: this design reduces cross-provider generic programming, but improves correctness, readability, and API truthfulness for real provider behavior.
 
+### Two construction paths
+
+Every provider offers two ways to create an instance:
+
+- **`Provider::new(...)`** (requires the `reqwest-client` feature) — takes only provider-specific arguments and uses a process-wide `reqwest::Client` via `LazyLock`. This is the simple path for most users.
+- **`Provider::from_options(ProviderOptions { ... })`** — always available, generic over any `HttpClient` implementation. Use this when you need custom timeouts, proxies, or a non-reqwest HTTP stack.
+
+```rust
+// Simple path (reqwest-client feature, the default)
+let google = Google::new("client-id", "secret", "https://example.com/cb");
+
+// Custom client path
+let custom = reqwest::Client::builder()
+    .timeout(std::time::Duration::from_secs(5))
+    .build()
+    .unwrap();
+let google = Google::from_options(GoogleOptions {
+    client_id: "client-id".into(),
+    client_secret: "secret".into(),
+    redirect_uri: "https://example.com/cb".into(),
+    http_client: &custom,
+});
+```
+
 ## Core building blocks
 
-- **Provider-specific clients.** Each provider exposes only the methods and parameters it actually supports.
+- **Provider-specific clients.** Each provider exposes only the methods and parameters it actually supports. Providers are generic over the HTTP client: `Provider<'a, H: HttpClient>`.
 - **`OAuth2Client`.** Spec-compliant helper that most providers embed. It understands when to send credentials via HTTP Basic versus form body and automatically injects PKCE parameters.
-- **`HttpClient` trait.** Minimal abstraction with a single asynchronous `send` method. Ship your own implementation or rely on the built-in `ReqwestClient`.
+- **`HttpClient` trait.** Minimal abstraction with a single asynchronous `send` method. Ship your own implementation or use `reqwest::Client` directly (enabled by default via the `reqwest-client` feature).
 - **`OAuth2Tokens`.** Convenience wrapper around the raw JSON response. Provides typed accessors (`access_token()`, `scopes()`, `access_token_expires_at()`, etc.) and exposes the original `serde_json::Value` for provider-specific attributes.
 - **Utilities.** `generate_state`, `generate_code_verifier`, `create_code_challenge`, and `decode_id_token` let you reproduce the ergonomic helpers from Arctic JS without dragging in heavyweight crypto dependencies.
 
@@ -496,8 +528,6 @@ The crate ships 64 pre-configured providers, each behind its own feature flag. E
 | Yandex             | `yandex`             | Not supported  | ✅      | ❌         |                                                                                |
 | Zoom               | `zoom`               | Required S256  | ✅      | ✅         |                                                                                |
 
-Use the `testing` feature (or plain `cargo test`) to access helper constructors such as `Google::with_endpoints` for pointing providers at mock OAuth servers.
-
 ## Use cases
 
 - Implement "Sign in with X" in async Rust web frameworks (Axum, Actix, Poem, etc.) with 64 providers available out of the box.
@@ -510,15 +540,13 @@ Use the `testing` feature (or plain `cargo test`) to access helper constructors 
 - **Authorization-code flow only.** There are no helpers for implicit, device-code, or client-credentials grants.
 - **Stateless utilities.** The crate never stores PKCE verifiers, CSRF state, or refresh tokens; you must persist and validate them.
 - **No JWT signature verification.** `decode_id_token` only base64url-decodes the payload. Bring your own JOSE/JWK validation if you need it.
-- **Authorization-code flow only per provider.** Each provider encodes its own endpoints and rules; adding a provider not in the catalog requires implementing the same pattern manually.
 - **Async-only.** There is no blocking API surface; call sites should run inside an async runtime.
 - **No automatic retries/backoff.** Error handling is explicit so you can plug in your own policies.
 
 ## Testing & quality
 
-- Run `cargo test --all-features` to execute every unit test plus the provider flow suites (they spin up mock OAuth servers via `wiremock`).
-- Each provider-specific test module (`tests/google_test.rs`, etc.) reuses a shared `provider_flow_tests!` macro so new providers inherit the same behavioral coverage automatically.
-- A complete architecture + rationale document lives in [`RFC-001-arctic-oauth.md`](./docs/rfcs/RFC-001-arctic-oauth.md). Use it as a checklist when contributing new providers or refactors.
+- Run `cargo test --all-features` to execute every unit test and doc test.
+- Each provider module includes tests that exercise authorization URL construction, token exchange, refresh, and revocation against an in-module mock HTTP client.
 
 ## Roadmap
 
@@ -526,7 +554,3 @@ Use the `testing` feature (or plain `cargo test`) to access helper constructors 
 2. Optional middleware utilities for Axum/Actix to streamline callback handling.
 3. Error reporting improvements (attach raw HTTP traces or response bodies behind feature flags).
 4. Explore lightweight JWT verification helpers without pulling full crypto stacks.
-
-## Related documents
-
-- [`RFC-001-arctic-oauth.md`](./docs/rfcs/RFC-001-arctic-oauth.md) — design goals, architecture overview, and testing philosophy for `arctic-oauth` v0.1.0.

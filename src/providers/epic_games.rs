@@ -7,6 +7,36 @@ const AUTHORIZATION_ENDPOINT: &str = "https://www.epicgames.com/id/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.epicgames.dev/epic/oauth/v2/token";
 const REVOCATION_ENDPOINT: &str = "https://api.epicgames.dev/epic/oauth/v2/revoke";
 
+/// Configuration for creating an [`EpicGames`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`EpicGames::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{EpicGames, EpicGamesOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let epic = EpicGames::from_options(EpicGamesOptions {
+///     client_id: "your-client-id".into(),
+///     client_secret: "your-client-secret".into(),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct EpicGamesOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Epic Games](https://dev.epicgames.com/docs/web-api-ref/authentication).
 ///
 /// Epic Games does not require PKCE. This client supports the full authorization code
@@ -34,7 +64,7 @@ const REVOCATION_ENDPOINT: &str = "https://api.epicgames.dev/epic/oauth/v2/revok
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{EpicGames, ReqwestClient, generate_state};
+/// use arctic_oauth::{EpicGames, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let epic = EpicGames::new(
@@ -49,31 +79,70 @@ const REVOCATION_ENDPOINT: &str = "https://api.epicgames.dev/epic/oauth/v2/revok
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = epic
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = epic
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// epic.revoke_token(&http, tokens.access_token()?).await?;
+/// epic.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct EpicGames {
+pub struct EpicGames<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl EpicGames {
-    /// Creates a new EpicGames OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> EpicGames<'a, H> {
+    /// Creates an EpicGames client from an [`EpicGamesOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`EpicGames::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{EpicGames, EpicGamesOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let epic = EpicGames::from_options(EpicGamesOptions {
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: "your-client-secret".into(),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: EpicGamesOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl EpicGames<'static, reqwest::Client> {
+    /// Creates a new EpicGames OAuth 2.0 client using the default HTTP client.
+    ///
+    /// The endpoints are automatically set to production values.
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`EpicGames::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -98,68 +167,16 @@ impl EpicGames {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
-        }
+        Self::from_options(EpicGamesOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl EpicGames {
-    /// Creates an EpicGames client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::EpicGames;
-    ///
-    /// let epic = EpicGames::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    ///     Some("http://localhost:8080/revoke"),
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-        revocation_endpoint: Option<&str>,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-            revocation_endpoint: revocation_endpoint
-                .unwrap_or(REVOCATION_ENDPOINT)
-                .to_string(),
-        }
-    }
-}
-
-impl EpicGames {
+impl<'a, H: HttpClient> EpicGames<'a, H> {
     /// Returns the provider name (`"EpicGames"`).
     pub fn name(&self) -> &'static str {
         "EpicGames"
@@ -199,8 +216,6 @@ impl EpicGames {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -211,26 +226,21 @@ impl EpicGames {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{EpicGames, ReqwestClient};
+    /// # use arctic_oauth::EpicGames;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let epic = EpicGames::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = epic
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, None)
+            .validate_authorization_code(self.http_client, &self.token_endpoint, code, None)
             .await
     }
 
@@ -241,7 +251,6 @@ impl EpicGames {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -252,26 +261,21 @@ impl EpicGames {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{EpicGames, ReqwestClient};
+    /// # use arctic_oauth::EpicGames;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let epic = EpicGames::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = epic
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 
@@ -282,7 +286,6 @@ impl EpicGames {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token or refresh token to revoke.
     ///
     /// # Errors
@@ -293,22 +296,17 @@ impl EpicGames {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{EpicGames, ReqwestClient};
+    /// # use arctic_oauth::EpicGames;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let epic = EpicGames::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
-    /// epic.revoke_token(&http, "token-to-revoke").await?;
+    /// epic.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         self.client
-            .revoke_token(http_client, &self.revocation_endpoint, token)
+            .revoke_token(self.http_client, &self.revocation_endpoint, token)
             .await
     }
 }
@@ -362,9 +360,19 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_epic(http_client: &MockHttpClient) -> EpicGames<'_, MockHttpClient> {
+        EpicGames::from_options(EpicGamesOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let epic = EpicGames::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let epic = make_epic(&mock);
         assert_eq!(epic.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(epic.token_endpoint, TOKEN_ENDPOINT);
         assert_eq!(epic.revocation_endpoint, REVOCATION_ENDPOINT);
@@ -372,13 +380,15 @@ mod tests {
 
     #[test]
     fn name_returns_epic_games() {
-        let epic = EpicGames::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let epic = make_epic(&mock);
         assert_eq!(epic.name(), "EpicGames");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let epic = EpicGames::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let epic = make_epic(&mock);
         let url = epic.authorization_url("state123", &["basic_profile"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -392,14 +402,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let epic = EpicGames::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -409,29 +411,19 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let epic = make_epic(&mock);
 
-        let tokens = epic
-            .validate_authorization_code(&mock, "auth-code")
-            .await
-            .unwrap();
+        let tokens = epic.validate_authorization_code("auth-code").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "epic-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
         assert!(get_header(&requests[0], "Authorization").is_some());
     }
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let epic = EpicGames::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -440,35 +432,26 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let epic = make_epic(&mock);
 
-        let tokens = epic
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = epic.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
     }
 
     #[tokio::test]
     async fn revoke_token_delegates_to_client() {
-        let epic = EpicGames::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let epic = make_epic(&mock);
 
-        let result = epic.revoke_token(&mock, "tok-to-revoke").await;
+        let result = epic.revoke_token("tok-to-revoke").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/revoke");
+        assert_eq!(requests[0].url, REVOCATION_ENDPOINT);
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("token".into(), "tok-to-revoke".into())));
     }

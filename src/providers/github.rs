@@ -6,6 +6,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://github.com/login/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token";
 
+/// Configuration for creating a [`GitHub`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`GitHub::new`] which uses the built-in default client.
+pub struct GitHubOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: Option<String>,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [GitHub](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps).
 ///
 /// GitHub does not require or support PKCE for OAuth Apps. This client supports the authorization
@@ -36,7 +48,7 @@ const TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{GitHub, ReqwestClient, generate_state};
+/// use arctic_oauth::{GitHub, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let github = GitHub::new(
@@ -51,24 +63,42 @@ const TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token";
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = github
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 /// # Ok(())
 /// # }
 /// ```
-pub struct GitHub {
+pub struct GitHub<'a, H: HttpClient> {
     client_id: String,
     client_secret: String,
     redirect_uri: Option<String>,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl GitHub {
-    /// Creates a new GitHub OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> GitHub<'a, H> {
+    /// Creates a GitHub client from a [`GitHubOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`GitHub::new`] instead.
+    pub fn from_options(options: GitHubOptions<'a, H>) -> Self {
+        Self {
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            redirect_uri: options.redirect_uri,
+            http_client: options.http_client,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl GitHub<'static, reqwest::Client> {
+    /// Creates a new GitHub OAuth 2.0 client using the default HTTP client.
     ///
     /// # Arguments
     ///
@@ -94,58 +124,16 @@ impl GitHub {
         client_secret: impl Into<String>,
         redirect_uri: Option<String>,
     ) -> Self {
-        Self {
+        Self::from_options(GitHubOptions {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             redirect_uri,
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl GitHub {
-    /// Creates a GitHub client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::GitHub;
-    ///
-    /// let github = GitHub::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     Some("http://localhost/callback".to_string()),
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: Option<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client_id: client_id.into(),
-            client_secret: client_secret.into(),
-            redirect_uri,
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl GitHub {
+impl<'a, H: HttpClient> GitHub<'a, H> {
     /// Returns the provider name (`"GitHub"`).
     pub fn name(&self) -> &'static str {
         "GitHub"
@@ -204,8 +192,6 @@ impl GitHub {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -216,24 +202,19 @@ impl GitHub {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{GitHub, ReqwestClient};
+    /// # use arctic_oauth::GitHub;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let github = GitHub::new("client-id", "secret", Some("https://example.com/cb".to_string()));
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = github
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         let mut body = vec![
             ("grant_type".to_string(), "authorization_code".to_string()),
             ("code".to_string(), code.to_string()),
@@ -250,7 +231,7 @@ impl GitHub {
             encode_basic_credentials(&self.client_id, &self.client_secret),
         ));
 
-        let response = http_client.send(request).await?;
+        let response = self.http_client.send(request).await?;
 
         match response.status {
             200 => {
@@ -356,35 +337,34 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_github(http_client: &MockHttpClient) -> GitHub<'_, MockHttpClient> {
+        GitHub::from_options(GitHubOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: Some("https://app/cb".into()),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let github = GitHub::new("cid", "secret", None);
+        let mock = MockHttpClient::new(vec![]);
+        let github = make_github(&mock);
         assert_eq!(github.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(github.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
-    fn with_endpoints_overrides_urls() {
-        let github = GitHub::with_endpoints(
-            "cid",
-            "secret",
-            None,
-            "https://mock/authorize",
-            "https://mock/token",
-        );
-        assert_eq!(github.authorization_endpoint, "https://mock/authorize");
-        assert_eq!(github.token_endpoint, "https://mock/token");
-    }
-
-    #[test]
     fn name_returns_github() {
-        let github = GitHub::new("cid", "secret", None);
+        let mock = MockHttpClient::new(vec![]);
+        let github = make_github(&mock);
         assert_eq!(github.name(), "GitHub");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let github = GitHub::new("cid", "secret", Some("https://app/cb".into()));
+        let mock = MockHttpClient::new(vec![]);
+        let github = make_github(&mock);
         let url = github.authorization_url("state123", &["repo", "user"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -397,7 +377,13 @@ mod tests {
 
     #[test]
     fn authorization_url_omits_scope_when_empty() {
-        let github = GitHub::new("cid", "secret", None);
+        let mock = MockHttpClient::new(vec![]);
+        let github = GitHub::from_options(GitHubOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: None,
+            http_client: &mock,
+        });
         let url = github.authorization_url("state123", &[]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -406,7 +392,13 @@ mod tests {
 
     #[test]
     fn authorization_url_omits_redirect_uri_when_none() {
-        let github = GitHub::new("cid", "secret", None);
+        let mock = MockHttpClient::new(vec![]);
+        let github = GitHub::from_options(GitHubOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: None,
+            http_client: &mock,
+        });
         let url = github.authorization_url("state123", &["repo"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -415,13 +407,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_correct_request() {
-        let github = GitHub::with_endpoints(
-            "cid",
-            "secret",
-            Some("https://app/cb".into()),
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -431,9 +416,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let github = make_github(&mock);
 
         let tokens = github
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
@@ -441,7 +427,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         // Check Basic auth header
         let auth = get_header(&requests[0], "Authorization").unwrap();
@@ -456,13 +442,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_omits_redirect_uri_when_none() {
-        let github = GitHub::with_endpoints(
-            "cid",
-            "secret",
-            None,
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -471,9 +450,15 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let github = GitHub::from_options(GitHubOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: None,
+            http_client: &mock,
+        });
 
         github
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
@@ -484,13 +469,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_error_as_200() {
-        let github = GitHub::with_endpoints(
-            "cid",
-            "secret",
-            None,
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -499,9 +477,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let github = make_github(&mock);
 
         let err = github
-            .validate_authorization_code(&mock, "bad-code")
+            .validate_authorization_code("bad-code")
             .await
             .unwrap_err();
 
@@ -521,13 +500,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_400_error() {
-        let github = GitHub::with_endpoints(
-            "cid",
-            "secret",
-            None,
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 400,
             body: serde_json::to_vec(&serde_json::json!({
@@ -536,9 +508,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let github = make_github(&mock);
 
         let err = github
-            .validate_authorization_code(&mock, "code")
+            .validate_authorization_code("code")
             .await
             .unwrap_err();
 
@@ -553,20 +526,14 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_unexpected_status() {
-        let github = GitHub::with_endpoints(
-            "cid",
-            "secret",
-            None,
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 500,
             body: b"Internal Server Error".to_vec(),
         }]);
+        let github = make_github(&mock);
 
         let err = github
-            .validate_authorization_code(&mock, "code")
+            .validate_authorization_code("code")
             .await
             .unwrap_err();
 

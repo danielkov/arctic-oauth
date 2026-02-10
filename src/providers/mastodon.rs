@@ -4,6 +4,38 @@ use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
 use crate::tokens::OAuth2Tokens;
 
+/// Configuration for creating a [`Mastodon`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Mastodon::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Mastodon, MastodonOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let mastodon = Mastodon::from_options(MastodonOptions {
+///     base_url: "https://mastodon.social".into(),
+///     client_id: "your-client-id".into(),
+///     client_secret: "your-client-secret".into(),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct MastodonOptions<'a, H: HttpClient> {
+    pub base_url: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Mastodon](https://docs.joinmastodon.org/client/token/).
 ///
 /// Mastodon requires PKCE with the S256 challenge method on all authorization requests.
@@ -32,7 +64,7 @@ use crate::tokens::OAuth2Tokens;
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Mastodon, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Mastodon, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let mastodon = Mastodon::new(
@@ -48,26 +80,67 @@ use crate::tokens::OAuth2Tokens;
 /// let url = mastodon.authorization_url(&state, &["read", "write"], &code_verifier);
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = mastodon
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Revoke a token.
-/// mastodon.revoke_token(&http, tokens.access_token()?).await?;
+/// mastodon.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Mastodon {
+pub struct Mastodon<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl Mastodon {
-    /// Creates a new Mastodon OAuth 2.0 client configured for a specific instance.
+impl<'a, H: HttpClient> Mastodon<'a, H> {
+    /// Creates a Mastodon client from a [`MastodonOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Mastodon::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Mastodon, MastodonOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let mastodon = Mastodon::from_options(MastodonOptions {
+    ///     base_url: "https://mastodon.social".into(),
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: "your-client-secret".into(),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: MastodonOptions<'a, H>) -> Self {
+        let base = options.base_url;
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: format!("{base}/api/v1/oauth/authorize"),
+            token_endpoint: format!("{base}/api/v1/oauth/token"),
+            revocation_endpoint: format!("{base}/api/v1/oauth/revoke"),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Mastodon<'static, reqwest::Client> {
+    /// Creates a new Mastodon OAuth 2.0 client configured for a specific instance using the default HTTP client.
+    ///
+    /// The endpoints are automatically constructed from the base URL.
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Mastodon::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -95,21 +168,17 @@ impl Mastodon {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        let base = base_url.into();
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: format!("{base}/api/v1/oauth/authorize"),
-            token_endpoint: format!("{base}/api/v1/oauth/token"),
-            revocation_endpoint: format!("{base}/api/v1/oauth/revoke"),
-        }
+        Self::from_options(MastodonOptions {
+            base_url: base_url.into(),
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-impl Mastodon {
+impl<'a, H: HttpClient> Mastodon<'a, H> {
     /// Returns the provider name (`"Mastodon"`).
     pub fn name(&self) -> &'static str {
         "Mastodon"
@@ -141,12 +210,7 @@ impl Mastodon {
     /// let url = mastodon.authorization_url(&state, &["read"], &verifier);
     /// assert!(url.as_str().starts_with("https://mastodon.social/"));
     /// ```
-    pub fn authorization_url(
-        &self,
-        state: &str,
-        scopes: &[&str],
-        code_verifier: &str,
-    ) -> url::Url {
+    pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
         self.client.create_authorization_url_with_pkce(
             &self.authorization_endpoint,
             state,
@@ -164,8 +228,6 @@ impl Mastodon {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -177,13 +239,12 @@ impl Mastodon {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Mastodon, ReqwestClient};
+    /// # use arctic_oauth::Mastodon;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let mastodon = Mastodon::new("https://mastodon.social", "client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = mastodon
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -192,13 +253,12 @@ impl Mastodon {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
             .validate_authorization_code(
-                http_client,
+                self.http_client,
                 &self.token_endpoint,
                 code,
                 Some(code_verifier),
@@ -212,7 +272,6 @@ impl Mastodon {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token to revoke.
     ///
     /// # Errors
@@ -223,22 +282,17 @@ impl Mastodon {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Mastodon, ReqwestClient};
+    /// # use arctic_oauth::Mastodon;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let mastodon = Mastodon::new("https://mastodon.social", "client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
-    /// mastodon.revoke_token(&http, "token-to-revoke").await?;
+    /// mastodon.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         self.client
-            .revoke_token(http_client, &self.revocation_endpoint, token)
+            .revoke_token(self.http_client, &self.revocation_endpoint, token)
             .await
     }
 }
@@ -284,14 +338,20 @@ mod tests {
             .collect()
     }
 
+    fn make_mastodon(http_client: &MockHttpClient) -> Mastodon<'_, MockHttpClient> {
+        Mastodon::from_options(MastodonOptions {
+            base_url: "https://mastodon.social".into(),
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_builds_endpoints_from_base_url() {
-        let mastodon = Mastodon::new(
-            "https://mastodon.social",
-            "cid",
-            "secret",
-            "https://app/cb",
-        );
+        let mock = MockHttpClient::new(vec![]);
+        let mastodon = make_mastodon(&mock);
         assert_eq!(
             mastodon.authorization_endpoint,
             "https://mastodon.social/api/v1/oauth/authorize"
@@ -308,13 +368,27 @@ mod tests {
 
     #[test]
     fn name_returns_mastodon() {
-        let mastodon = Mastodon::new("https://mastodon.social", "cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let mastodon = Mastodon::from_options(MastodonOptions {
+            base_url: "https://mastodon.social".into(),
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
         assert_eq!(mastodon.name(), "Mastodon");
     }
 
     #[test]
     fn authorization_url_includes_pkce() {
-        let mastodon = Mastodon::new("https://mastodon.social", "cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let mastodon = Mastodon::from_options(MastodonOptions {
+            base_url: "https://mastodon.social".into(),
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
         let url = mastodon.authorization_url("state123", &["read"], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -325,7 +399,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_verifier() {
-        let mastodon = Mastodon::new("https://mock", "cid", "secret", "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -334,32 +407,39 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let mastodon = make_mastodon(&mock);
 
         let tokens = mastodon
-            .validate_authorization_code(&mock, "code", "verifier")
+            .validate_authorization_code("code", "verifier")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "masto-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/api/v1/oauth/token");
+        assert_eq!(
+            requests[0].url,
+            "https://mastodon.social/api/v1/oauth/token"
+        );
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("code_verifier".into(), "verifier".into())));
     }
 
     #[tokio::test]
     async fn revoke_token_delegates_to_client() {
-        let mastodon = Mastodon::new("https://mock", "cid", "secret", "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let mastodon = make_mastodon(&mock);
 
-        let result = mastodon.revoke_token(&mock, "tok").await;
+        let result = mastodon.revoke_token("tok").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/api/v1/oauth/revoke");
+        assert_eq!(
+            requests[0].url,
+            "https://mastodon.social/api/v1/oauth/revoke"
+        );
     }
 }

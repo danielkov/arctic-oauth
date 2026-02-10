@@ -4,6 +4,38 @@ use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
 use crate::tokens::OAuth2Tokens;
 
+/// Configuration for creating a [`KeyCloak`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`KeyCloak::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{KeyCloak, KeyCloakOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let keycloak = KeyCloak::from_options(KeyCloakOptions {
+///     realm_url: "https://keycloak.example.com/realms/myrealm".into(),
+///     client_id: "your-client-id".into(),
+///     client_secret: Some("your-client-secret".into()),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct KeyCloakOptions<'a, H: HttpClient> {
+    pub realm_url: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Keycloak](https://www.keycloak.org/docs/latest/securing_apps/#_oidc).
 ///
 /// Keycloak requires PKCE with the S256 challenge method on all authorization requests.
@@ -34,7 +66,7 @@ use crate::tokens::OAuth2Tokens;
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{KeyCloak, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{KeyCloak, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let keycloak = KeyCloak::new(
@@ -51,31 +83,72 @@ use crate::tokens::OAuth2Tokens;
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = keycloak
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = keycloak
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// keycloak.revoke_token(&http, tokens.access_token()?).await?;
+/// keycloak.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct KeyCloak {
+pub struct KeyCloak<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl KeyCloak {
-    /// Creates a new Keycloak OAuth 2.0 client for a specific realm.
+impl<'a, H: HttpClient> KeyCloak<'a, H> {
+    /// Creates a KeyCloak client from a [`KeyCloakOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`KeyCloak::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{KeyCloak, KeyCloakOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let keycloak = KeyCloak::from_options(KeyCloakOptions {
+    ///     realm_url: "https://keycloak.example.com/realms/myrealm".into(),
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: Some("your-client-secret".into()),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: KeyCloakOptions<'a, H>) -> Self {
+        let realm = options.realm_url;
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                options.client_secret,
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: format!("{realm}/protocol/openid-connect/auth"),
+            token_endpoint: format!("{realm}/protocol/openid-connect/token"),
+            revocation_endpoint: format!("{realm}/protocol/openid-connect/revoke"),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl KeyCloak<'static, reqwest::Client> {
+    /// Creates a new Keycloak OAuth 2.0 client for a specific realm using the default HTTP client.
+    ///
+    /// The endpoints are automatically constructed from your Keycloak realm URL.
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`KeyCloak::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -104,17 +177,17 @@ impl KeyCloak {
         client_secret: Option<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        let realm = realm_url.into();
-        Self {
-            client: OAuth2Client::new(client_id, client_secret, Some(redirect_uri.into())),
-            authorization_endpoint: format!("{realm}/protocol/openid-connect/auth"),
-            token_endpoint: format!("{realm}/protocol/openid-connect/token"),
-            revocation_endpoint: format!("{realm}/protocol/openid-connect/revoke"),
-        }
+        Self::from_options(KeyCloakOptions {
+            realm_url: realm_url.into(),
+            client_id: client_id.into(),
+            client_secret,
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-impl KeyCloak {
+impl<'a, H: HttpClient> KeyCloak<'a, H> {
     /// Returns the provider name (`"KeyCloak"`).
     pub fn name(&self) -> &'static str {
         "KeyCloak"
@@ -146,12 +219,7 @@ impl KeyCloak {
     /// let url = keycloak.authorization_url(&state, &["openid"], &verifier);
     /// assert!(url.as_str().contains("/protocol/openid-connect/auth"));
     /// ```
-    pub fn authorization_url(
-        &self,
-        state: &str,
-        scopes: &[&str],
-        code_verifier: &str,
-    ) -> url::Url {
+    pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
         self.client.create_authorization_url_with_pkce(
             &self.authorization_endpoint,
             state,
@@ -169,8 +237,6 @@ impl KeyCloak {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -182,13 +248,12 @@ impl KeyCloak {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{KeyCloak, ReqwestClient};
+    /// # use arctic_oauth::KeyCloak;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let keycloak = KeyCloak::new("https://kc.example.com/realms/r", "client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = keycloak
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -197,13 +262,12 @@ impl KeyCloak {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
             .validate_authorization_code(
-                http_client,
+                self.http_client,
                 &self.token_endpoint,
                 code,
                 Some(code_verifier),
@@ -219,7 +283,6 @@ impl KeyCloak {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -230,26 +293,21 @@ impl KeyCloak {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{KeyCloak, ReqwestClient};
+    /// # use arctic_oauth::KeyCloak;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let keycloak = KeyCloak::new("https://kc.example.com/realms/r", "client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = keycloak
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 
@@ -260,7 +318,6 @@ impl KeyCloak {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token or refresh token to revoke.
     ///
     /// # Errors
@@ -271,22 +328,17 @@ impl KeyCloak {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{KeyCloak, ReqwestClient};
+    /// # use arctic_oauth::KeyCloak;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let keycloak = KeyCloak::new("https://kc.example.com/realms/r", "client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
-    /// keycloak.revoke_token(&http, "token-to-revoke").await?;
+    /// keycloak.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         self.client
-            .revoke_token(http_client, &self.revocation_endpoint, token)
+            .revoke_token(self.http_client, &self.revocation_endpoint, token)
             .await
     }
 }
@@ -332,14 +384,20 @@ mod tests {
             .collect()
     }
 
+    fn make_keycloak(http_client: &MockHttpClient) -> KeyCloak<'_, MockHttpClient> {
+        KeyCloak::from_options(KeyCloakOptions {
+            realm_url: "https://keycloak.example.com/realms/myrealm".into(),
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_builds_endpoints_from_realm_url() {
-        let kc = KeyCloak::new(
-            "https://keycloak.example.com/realms/myrealm",
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-        );
+        let mock = MockHttpClient::new(vec![]);
+        let kc = make_keycloak(&mock);
         assert_eq!(
             kc.authorization_endpoint,
             "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/auth"
@@ -356,13 +414,27 @@ mod tests {
 
     #[test]
     fn name_returns_keycloak() {
-        let kc = KeyCloak::new("https://kc.example.com/realms/r", "cid", None, "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let kc = KeyCloak::from_options(KeyCloakOptions {
+            realm_url: "https://kc.example.com/realms/r".into(),
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
         assert_eq!(kc.name(), "KeyCloak");
     }
 
     #[test]
     fn authorization_url_includes_pkce() {
-        let kc = KeyCloak::new("https://kc.example.com/realms/r", "cid", None, "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let kc = KeyCloak::from_options(KeyCloakOptions {
+            realm_url: "https://kc.example.com/realms/r".into(),
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
         let url = kc.authorization_url("state123", &["openid"], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -373,7 +445,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_verifier() {
-        let kc = KeyCloak::new("https://mock", "cid", Some("secret".into()), "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -382,9 +453,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let kc = make_keycloak(&mock);
 
         let tokens = kc
-            .validate_authorization_code(&mock, "code", "verifier")
+            .validate_authorization_code("code", "verifier")
             .await
             .unwrap();
 
@@ -393,7 +465,7 @@ mod tests {
         let requests = mock.take_requests();
         assert_eq!(
             requests[0].url,
-            "https://mock/protocol/openid-connect/token"
+            "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/token"
         );
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("code_verifier".into(), "verifier".into())));
@@ -401,19 +473,19 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_token_delegates_to_client() {
-        let kc = KeyCloak::new("https://mock", "cid", Some("secret".into()), "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let kc = make_keycloak(&mock);
 
-        let result = kc.revoke_token(&mock, "tok").await;
+        let result = kc.revoke_token("tok").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
         assert_eq!(
             requests[0].url,
-            "https://mock/protocol/openid-connect/revoke"
+            "https://keycloak.example.com/realms/myrealm/protocol/openid-connect/revoke"
         );
     }
 }

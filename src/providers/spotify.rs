@@ -7,6 +7,36 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_ENDPOINT: &str = "https://accounts.spotify.com/api/token";
 
+/// Configuration for creating a [`Spotify`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Spotify::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Spotify, SpotifyOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let spotify = Spotify::from_options(SpotifyOptions {
+///     client_id: "your-client-id".into(),
+///     client_secret: Some("your-client-secret".into()),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct SpotifyOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Spotify](https://developer.spotify.com/documentation/web-api/concepts/authorization).
 ///
 /// Spotify supports optional PKCE with the S256 challenge method for enhanced security,
@@ -37,7 +67,7 @@ const TOKEN_ENDPOINT: &str = "https://accounts.spotify.com/api/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Spotify, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Spotify, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let spotify = Spotify::new(
@@ -53,27 +83,64 @@ const TOKEN_ENDPOINT: &str = "https://accounts.spotify.com/api/token";
 /// // Store `state` and optionally `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = spotify
-///     .validate_authorization_code(&http, "authorization-code", Some(&code_verifier))
+///     .validate_authorization_code("authorization-code", Some(&code_verifier))
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = spotify
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Spotify {
+pub struct Spotify<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Spotify {
-    /// Creates a new Spotify OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Spotify<'a, H> {
+    /// Creates a Spotify client from a [`SpotifyOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Spotify::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Spotify, SpotifyOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let spotify = Spotify::from_options(SpotifyOptions {
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: Some("your-client-secret".into()),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: SpotifyOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                options.client_secret,
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Spotify<'static, reqwest::Client> {
+    /// Creates a new Spotify OAuth 2.0 client using the default HTTP client.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Spotify::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -107,54 +174,16 @@ impl Spotify {
         client_secret: Option<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, client_secret, Some(redirect_uri.into())),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+        Self::from_options(SpotifyOptions {
+            client_id: client_id.into(),
+            client_secret,
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Spotify {
-    /// Creates a Spotify client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Spotify;
-    ///
-    /// let spotify = Spotify::with_endpoints(
-    ///     "test-client-id",
-    ///     Some("test-secret".to_string()),
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: Option<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, client_secret, Some(redirect_uri.into())),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Spotify {
+impl<'a, H: HttpClient> Spotify<'a, H> {
     /// Returns the provider name (`"Spotify"`).
     pub fn name(&self) -> &'static str {
         "Spotify"
@@ -223,8 +252,6 @@ impl Spotify {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///   Pass `None` if PKCE was not used.
@@ -237,13 +264,12 @@ impl Spotify {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Spotify, ReqwestClient};
+    /// # use arctic_oauth::Spotify;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let spotify = Spotify::new("client-id", Some("secret".to_string()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = spotify
-    ///     .validate_authorization_code(&http, "the-auth-code", Some("the-code-verifier"))
+    ///     .validate_authorization_code("the-auth-code", Some("the-code-verifier"))
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -252,12 +278,16 @@ impl Spotify {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: Option<&str>,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, code_verifier)
+            .validate_authorization_code(
+                self.http_client,
+                &self.token_endpoint,
+                code,
+                code_verifier,
+            )
             .await
     }
 
@@ -269,7 +299,6 @@ impl Spotify {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -280,26 +309,21 @@ impl Spotify {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Spotify, ReqwestClient};
+    /// # use arctic_oauth::Spotify;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let spotify = Spotify::new("client-id", Some("secret".to_string()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = spotify
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 }
@@ -353,37 +377,40 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_spotify(http_client: &MockHttpClient) -> Spotify<'_, MockHttpClient> {
+        Spotify::from_options(SpotifyOptions {
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let spotify = Spotify::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let spotify = make_spotify(&mock);
         assert_eq!(spotify.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(spotify.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
-    fn with_endpoints_overrides_urls() {
-        let spotify = Spotify::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
-        assert_eq!(spotify.authorization_endpoint, "https://mock/authorize");
-        assert_eq!(spotify.token_endpoint, "https://mock/token");
-    }
-
-    #[test]
     fn name_returns_spotify() {
-        let spotify = Spotify::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let spotify = make_spotify(&mock);
         assert_eq!(spotify.name(), "Spotify");
     }
 
     #[test]
     fn authorization_url_without_pkce() {
-        let spotify = Spotify::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let spotify = make_spotify(&mock);
         let url = spotify
-            .authorization_url("state123", &["user-read-email", "playlist-read-private"], None)
+            .authorization_url(
+                "state123",
+                &["user-read-email", "playlist-read-private"],
+                None,
+            )
             .unwrap();
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -400,7 +427,8 @@ mod tests {
 
     #[test]
     fn authorization_url_with_pkce() {
-        let spotify = Spotify::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let spotify = make_spotify(&mock);
         let url = spotify
             .authorization_url("state123", &["user-read-email"], Some("my-verifier"))
             .unwrap();
@@ -412,13 +440,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let spotify = Spotify::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -428,9 +449,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let spotify = make_spotify(&mock);
 
         let tokens = spotify
-            .validate_authorization_code(&mock, "auth-code", Some("verifier"))
+            .validate_authorization_code("auth-code", Some("verifier"))
             .await
             .unwrap();
 
@@ -438,7 +460,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "authorization_code".into())));
@@ -448,13 +470,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_public_client_sends_client_id_in_body() {
-        let spotify = Spotify::with_endpoints(
-            "cid",
-            None,
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -464,9 +479,15 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let spotify = Spotify::from_options(SpotifyOptions {
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
 
         spotify
-            .validate_authorization_code(&mock, "auth-code", Some("verifier"))
+            .validate_authorization_code("auth-code", Some("verifier"))
             .await
             .unwrap();
 
@@ -478,13 +499,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let spotify = Spotify::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -493,17 +507,15 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let spotify = make_spotify(&mock);
 
-        let tokens = spotify
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = spotify.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "refresh_token".into())));

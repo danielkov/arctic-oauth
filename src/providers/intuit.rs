@@ -7,6 +7,36 @@ const AUTHORIZATION_ENDPOINT: &str = "https://appcenter.intuit.com/connect/oauth
 const TOKEN_ENDPOINT: &str = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
 const REVOCATION_ENDPOINT: &str = "https://developer.api.intuit.com/v2/oauth2/tokens/revoke";
 
+/// Configuration for creating an [`Intuit`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Intuit::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Intuit, IntuitOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let intuit = Intuit::from_options(IntuitOptions {
+///     client_id: "your-client-id".into(),
+///     client_secret: "your-client-secret".into(),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct IntuitOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Intuit](https://developer.intuit.com/app/developer/qbo/docs/develop/authentication-and-authorization/oauth-2.0).
 ///
 /// Intuit does not require PKCE. This client supports the full authorization code flow
@@ -36,7 +66,7 @@ const REVOCATION_ENDPOINT: &str = "https://developer.api.intuit.com/v2/oauth2/to
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Intuit, ReqwestClient, generate_state};
+/// use arctic_oauth::{Intuit, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let intuit = Intuit::new(
@@ -51,31 +81,69 @@ const REVOCATION_ENDPOINT: &str = "https://developer.api.intuit.com/v2/oauth2/to
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = intuit
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = intuit
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// intuit.revoke_token(&http, tokens.access_token()?).await?;
+/// intuit.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Intuit {
+pub struct Intuit<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl Intuit {
-    /// Creates a new Intuit OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Intuit<'a, H> {
+    /// Creates an Intuit client from an [`IntuitOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Intuit::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Intuit, IntuitOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let intuit = Intuit::from_options(IntuitOptions {
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: "your-client-secret".into(),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: IntuitOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Intuit<'static, reqwest::Client> {
+    /// Creates a new Intuit OAuth 2.0 client configured with production endpoints using the default HTTP client.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Intuit::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -100,68 +168,16 @@ impl Intuit {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
-        }
+        Self::from_options(IntuitOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Intuit {
-    /// Creates an Intuit client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Intuit;
-    ///
-    /// let intuit = Intuit::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    ///     Some("http://localhost:8080/revoke"),
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-        revocation_endpoint: Option<&str>,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-            revocation_endpoint: revocation_endpoint
-                .unwrap_or(REVOCATION_ENDPOINT)
-                .to_string(),
-        }
-    }
-}
-
-impl Intuit {
+impl<'a, H: HttpClient> Intuit<'a, H> {
     /// Returns the provider name (`"Intuit"`).
     pub fn name(&self) -> &'static str {
         "Intuit"
@@ -201,8 +217,6 @@ impl Intuit {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -213,26 +227,21 @@ impl Intuit {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Intuit, ReqwestClient};
+    /// # use arctic_oauth::Intuit;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let intuit = Intuit::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = intuit
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, None)
+            .validate_authorization_code(self.http_client, &self.token_endpoint, code, None)
             .await
     }
 
@@ -244,7 +253,6 @@ impl Intuit {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -255,26 +263,21 @@ impl Intuit {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Intuit, ReqwestClient};
+    /// # use arctic_oauth::Intuit;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let intuit = Intuit::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = intuit
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 
@@ -286,7 +289,6 @@ impl Intuit {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token or refresh token to revoke.
     ///
     /// # Errors
@@ -297,22 +299,17 @@ impl Intuit {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Intuit, ReqwestClient};
+    /// # use arctic_oauth::Intuit;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let intuit = Intuit::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
-    /// intuit.revoke_token(&http, "token-to-revoke").await?;
+    /// intuit.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         self.client
-            .revoke_token(http_client, &self.revocation_endpoint, token)
+            .revoke_token(self.http_client, &self.revocation_endpoint, token)
             .await
     }
 }
@@ -366,9 +363,19 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_intuit(http_client: &MockHttpClient) -> Intuit<'_, MockHttpClient> {
+        Intuit::from_options(IntuitOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let intuit = Intuit::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let intuit = make_intuit(&mock);
         assert_eq!(intuit.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(intuit.token_endpoint, TOKEN_ENDPOINT);
         assert_eq!(intuit.revocation_endpoint, REVOCATION_ENDPOINT);
@@ -376,36 +383,27 @@ mod tests {
 
     #[test]
     fn name_returns_intuit() {
-        let intuit = Intuit::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let intuit = make_intuit(&mock);
         assert_eq!(intuit.name(), "Intuit");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let intuit = Intuit::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let intuit = make_intuit(&mock);
         let url = intuit.authorization_url("state123", &["com.intuit.quickbooks.accounting"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
         assert!(pairs.contains(&("response_type".into(), "code".into())));
         assert!(pairs.contains(&("client_id".into(), "cid".into())));
         assert!(pairs.contains(&("state".into(), "state123".into())));
-        assert!(pairs.contains(&(
-            "scope".into(),
-            "com.intuit.quickbooks.accounting".into()
-        )));
+        assert!(pairs.contains(&("scope".into(), "com.intuit.quickbooks.accounting".into())));
         assert!(pairs.contains(&("redirect_uri".into(), "https://app/cb".into())));
     }
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let intuit = Intuit::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -415,29 +413,25 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let intuit = make_intuit(&mock);
 
         let tokens = intuit
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "intuit-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(
+            requests[0].url,
+            "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer"
+        );
         assert!(get_header(&requests[0], "Authorization").is_some());
     }
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let intuit = Intuit::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -446,35 +440,29 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let intuit = make_intuit(&mock);
 
-        let tokens = intuit
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = intuit.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
     }
 
     #[tokio::test]
     async fn revoke_token_delegates_to_client() {
-        let intuit = Intuit::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let intuit = make_intuit(&mock);
 
-        let result = intuit.revoke_token(&mock, "tok-to-revoke").await;
+        let result = intuit.revoke_token("tok-to-revoke").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/revoke");
+        assert_eq!(
+            requests[0].url,
+            "https://developer.api.intuit.com/v2/oauth2/tokens/revoke"
+        );
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("token".into(), "tok-to-revoke".into())));
     }

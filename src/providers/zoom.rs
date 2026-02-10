@@ -8,6 +8,18 @@ const AUTHORIZATION_ENDPOINT: &str = "https://zoom.us/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://zoom.us/oauth/token";
 const REVOCATION_ENDPOINT: &str = "https://zoom.us/oauth/revoke";
 
+/// Configuration for creating a [`Zoom`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Zoom::new`] which uses the built-in default client.
+pub struct ZoomOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Zoom](https://developers.zoom.us/docs/integrations/oauth/).
 ///
 /// Zoom requires PKCE (Proof Key for Code Exchange) with the S256 challenge method
@@ -37,7 +49,7 @@ const REVOCATION_ENDPOINT: &str = "https://zoom.us/oauth/revoke";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Zoom, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Zoom, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let provider = Zoom::new(
@@ -52,31 +64,55 @@ const REVOCATION_ENDPOINT: &str = "https://zoom.us/oauth/revoke";
 /// let url = provider.authorization_url(&state, &["user:read", "meeting:read"], &code_verifier);
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = provider
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = provider
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// provider.revoke_token(&http, tokens.access_token()?).await?;
+/// provider.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Zoom {
+pub struct Zoom<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl Zoom {
+impl<'a, H: HttpClient> Zoom<'a, H> {
+    /// Creates a Zoom client from a [`ZoomOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Zoom::new`] instead.
+    pub fn from_options(options: ZoomOptions<'a, H>) -> Self {
+        Self {
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                Some(options.redirect_uri),
+            ),
+            http_client: options.http_client,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Zoom<'static, reqwest::Client> {
     /// Creates a new Zoom OAuth 2.0 client configured with production endpoints.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Zoom::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -101,68 +137,16 @@ impl Zoom {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
-        }
+        Self::from_options(ZoomOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Zoom {
-    /// Creates a Zoom client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Zoom;
-    ///
-    /// let provider = Zoom::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    ///     Some("http://localhost:8080/revoke"),
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-        revocation_endpoint: Option<&str>,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-            revocation_endpoint: revocation_endpoint
-                .unwrap_or(REVOCATION_ENDPOINT)
-                .to_string(),
-        }
-    }
-}
-
-impl Zoom {
+impl<'a, H: HttpClient> Zoom<'a, H> {
     /// Returns the provider name (`"Zoom"`).
     pub fn name(&self) -> &'static str {
         "Zoom"
@@ -192,12 +176,7 @@ impl Zoom {
     ///
     /// let url = provider.authorization_url(&state, &["user:read", "meeting:read"], &verifier);
     /// ```
-    pub fn authorization_url(
-        &self,
-        state: &str,
-        scopes: &[&str],
-        code_verifier: &str,
-    ) -> url::Url {
+    pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
         self.client.create_authorization_url_with_pkce(
             &self.authorization_endpoint,
             state,
@@ -215,8 +194,6 @@ impl Zoom {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier used when creating the authorization URL.
     ///
@@ -228,13 +205,12 @@ impl Zoom {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Zoom, ReqwestClient};
+    /// # use arctic_oauth::Zoom;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let provider = Zoom::new("client-id", "client-secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = provider
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -243,13 +219,12 @@ impl Zoom {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
             .validate_authorization_code(
-                http_client,
+                self.http_client,
                 &self.token_endpoint,
                 code,
                 Some(code_verifier),
@@ -264,7 +239,6 @@ impl Zoom {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -275,26 +249,21 @@ impl Zoom {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Zoom, ReqwestClient};
+    /// # use arctic_oauth::Zoom;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let provider = Zoom::new("client-id", "client-secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = provider
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 
@@ -305,7 +274,6 @@ impl Zoom {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token or refresh token to revoke.
     ///
     /// # Errors
@@ -316,22 +284,17 @@ impl Zoom {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Zoom, ReqwestClient};
+    /// # use arctic_oauth::Zoom;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let provider = Zoom::new("client-id", "client-secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
-    /// provider.revoke_token(&http, "token-to-revoke").await?;
+    /// provider.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         self.client
-            .revoke_token(http_client, &self.revocation_endpoint, token)
+            .revoke_token(self.http_client, &self.revocation_endpoint, token)
             .await
     }
 }
@@ -377,6 +340,15 @@ mod tests {
             .collect()
     }
 
+    fn make_zoom(http_client: &MockHttpClient) -> Zoom<'_, MockHttpClient> {
+        Zoom::from_options(ZoomOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     fn get_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
         request
             .headers
@@ -387,7 +359,8 @@ mod tests {
 
     #[test]
     fn new_sets_production_endpoints() {
-        let zoom = Zoom::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let zoom = make_zoom(&mock);
         assert_eq!(zoom.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(zoom.token_endpoint, TOKEN_ENDPOINT);
         assert_eq!(zoom.revocation_endpoint, REVOCATION_ENDPOINT);
@@ -395,13 +368,15 @@ mod tests {
 
     #[test]
     fn name_returns_zoom() {
-        let zoom = Zoom::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let zoom = make_zoom(&mock);
         assert_eq!(zoom.name(), "Zoom");
     }
 
     #[test]
     fn authorization_url_includes_pkce() {
-        let zoom = Zoom::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let zoom = make_zoom(&mock);
         let url = zoom.authorization_url("state123", &["meeting:read"], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -415,14 +390,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let zoom = Zoom::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -432,16 +399,17 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let zoom = make_zoom(&mock);
 
         let tokens = zoom
-            .validate_authorization_code(&mock, "auth-code", "verifier")
+            .validate_authorization_code("auth-code", "verifier")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "zoom-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("code_verifier".into(), "verifier".into())));
         assert!(get_header(&requests[0], "Authorization").is_some());
@@ -449,14 +417,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let zoom = Zoom::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -465,35 +425,26 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let zoom = make_zoom(&mock);
 
-        let tokens = zoom
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = zoom.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
     }
 
     #[tokio::test]
     async fn revoke_token_delegates_to_client() {
-        let zoom = Zoom::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let zoom = make_zoom(&mock);
 
-        let result = zoom.revoke_token(&mock, "tok-to-revoke").await;
+        let result = zoom.revoke_token("tok-to-revoke").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/revoke");
+        assert_eq!(requests[0].url, REVOCATION_ENDPOINT);
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("token".into(), "tok-to-revoke".into())));
     }

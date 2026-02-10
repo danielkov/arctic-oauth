@@ -4,6 +4,38 @@ use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
 use crate::tokens::OAuth2Tokens;
 
+/// Configuration for creating a [`Salesforce`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Salesforce::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Salesforce, SalesforceOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let salesforce = Salesforce::from_options(SalesforceOptions {
+///     domain: "login.salesforce.com".into(),
+///     client_id: "your-consumer-key".into(),
+///     client_secret: Some("your-consumer-secret".into()),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct SalesforceOptions<'a, H: HttpClient> {
+    pub domain: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Salesforce](https://help.salesforce.com/s/articleView?id=sf.remoteaccess_oauth_web_server_flow.htm).
 ///
 /// Salesforce requires PKCE with the S256 challenge method for authorization requests.
@@ -37,7 +69,7 @@ use crate::tokens::OAuth2Tokens;
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Salesforce, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Salesforce, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let salesforce = Salesforce::new(
@@ -54,31 +86,72 @@ use crate::tokens::OAuth2Tokens;
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = salesforce
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = salesforce
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// salesforce.revoke_token(&http, tokens.access_token()?).await?;
+/// salesforce.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Salesforce {
+pub struct Salesforce<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl Salesforce {
-    /// Creates a new Salesforce OAuth 2.0 client configured for the specified domain.
+impl<'a, H: HttpClient> Salesforce<'a, H> {
+    /// Creates a Salesforce client from a [`SalesforceOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Salesforce::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Salesforce, SalesforceOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let salesforce = Salesforce::from_options(SalesforceOptions {
+    ///     domain: "login.salesforce.com".into(),
+    ///     client_id: "your-consumer-key".into(),
+    ///     client_secret: Some("your-consumer-secret".into()),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: SalesforceOptions<'a, H>) -> Self {
+        let domain = options.domain;
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                options.client_secret,
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: format!("https://{domain}/services/oauth2/authorize"),
+            token_endpoint: format!("https://{domain}/services/oauth2/token"),
+            revocation_endpoint: format!("https://{domain}/services/oauth2/revoke"),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Salesforce<'static, reqwest::Client> {
+    /// Creates a new Salesforce OAuth 2.0 client configured for the specified domain using the default HTTP client.
+    ///
+    /// The endpoints are automatically constructed from your Salesforce domain.
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Salesforce::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -124,17 +197,17 @@ impl Salesforce {
         client_secret: Option<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        let domain = domain.into();
-        Self {
-            client: OAuth2Client::new(client_id, client_secret, Some(redirect_uri.into())),
-            authorization_endpoint: format!("https://{domain}/services/oauth2/authorize"),
-            token_endpoint: format!("https://{domain}/services/oauth2/token"),
-            revocation_endpoint: format!("https://{domain}/services/oauth2/revoke"),
-        }
+        Self::from_options(SalesforceOptions {
+            domain: domain.into(),
+            client_id: client_id.into(),
+            client_secret,
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-impl Salesforce {
+impl<'a, H: HttpClient> Salesforce<'a, H> {
     /// Returns the provider name (`"Salesforce"`).
     pub fn name(&self) -> &'static str {
         "Salesforce"
@@ -171,12 +244,7 @@ impl Salesforce {
     /// let url = salesforce.authorization_url(&state, &["api", "refresh_token"], &verifier);
     /// assert!(url.as_str().starts_with("https://login.salesforce.com/"));
     /// ```
-    pub fn authorization_url(
-        &self,
-        state: &str,
-        scopes: &[&str],
-        code_verifier: &str,
-    ) -> url::Url {
+    pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
         self.client.create_authorization_url_with_pkce(
             &self.authorization_endpoint,
             state,
@@ -194,8 +262,6 @@ impl Salesforce {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -207,7 +273,7 @@ impl Salesforce {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Salesforce, ReqwestClient};
+    /// # use arctic_oauth::Salesforce;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let salesforce = Salesforce::new(
     ///     "login.salesforce.com",
@@ -215,10 +281,9 @@ impl Salesforce {
     ///     Some("secret".into()),
     ///     "https://example.com/cb"
     /// );
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = salesforce
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -227,13 +292,12 @@ impl Salesforce {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
             .validate_authorization_code(
-                http_client,
+                self.http_client,
                 &self.token_endpoint,
                 code,
                 Some(code_verifier),
@@ -250,7 +314,6 @@ impl Salesforce {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -261,7 +324,7 @@ impl Salesforce {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Salesforce, ReqwestClient};
+    /// # use arctic_oauth::Salesforce;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let salesforce = Salesforce::new(
     ///     "login.salesforce.com",
@@ -269,23 +332,18 @@ impl Salesforce {
     ///     Some("secret".into()),
     ///     "https://example.com/cb"
     /// );
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = salesforce
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 
@@ -296,7 +354,6 @@ impl Salesforce {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token or refresh token to revoke.
     ///
     /// # Errors
@@ -307,7 +364,7 @@ impl Salesforce {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Salesforce, ReqwestClient};
+    /// # use arctic_oauth::Salesforce;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let salesforce = Salesforce::new(
     ///     "login.salesforce.com",
@@ -315,19 +372,14 @@ impl Salesforce {
     ///     Some("secret".into()),
     ///     "https://example.com/cb"
     /// );
-    /// let http = ReqwestClient::new();
     ///
-    /// salesforce.revoke_token(&http, "token-to-revoke").await?;
+    /// salesforce.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         self.client
-            .revoke_token(http_client, &self.revocation_endpoint, token)
+            .revoke_token(self.http_client, &self.revocation_endpoint, token)
             .await
     }
 }
@@ -373,14 +425,20 @@ mod tests {
             .collect()
     }
 
+    fn make_salesforce(http_client: &MockHttpClient) -> Salesforce<'_, MockHttpClient> {
+        Salesforce::from_options(SalesforceOptions {
+            domain: "login.salesforce.com".into(),
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_builds_endpoints_from_domain() {
-        let sf = Salesforce::new(
-            "login.salesforce.com",
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-        );
+        let mock = MockHttpClient::new(vec![]);
+        let sf = make_salesforce(&mock);
         assert_eq!(
             sf.authorization_endpoint,
             "https://login.salesforce.com/services/oauth2/authorize"
@@ -397,13 +455,27 @@ mod tests {
 
     #[test]
     fn name_returns_salesforce() {
-        let sf = Salesforce::new("login.salesforce.com", "cid", None, "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let sf = Salesforce::from_options(SalesforceOptions {
+            domain: "login.salesforce.com".into(),
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
         assert_eq!(sf.name(), "Salesforce");
     }
 
     #[test]
     fn authorization_url_includes_pkce() {
-        let sf = Salesforce::new("login.salesforce.com", "cid", None, "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let sf = Salesforce::from_options(SalesforceOptions {
+            domain: "login.salesforce.com".into(),
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
         let url = sf.authorization_url("state123", &["api"], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -414,12 +486,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_verifier() {
-        let sf = Salesforce::new(
-            "mock.salesforce.com",
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -428,9 +494,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let sf = make_salesforce(&mock);
 
         let tokens = sf
-            .validate_authorization_code(&mock, "code", "verifier")
+            .validate_authorization_code("code", "verifier")
             .await
             .unwrap();
 
@@ -439,7 +506,7 @@ mod tests {
         let requests = mock.take_requests();
         assert_eq!(
             requests[0].url,
-            "https://mock.salesforce.com/services/oauth2/token"
+            "https://login.salesforce.com/services/oauth2/token"
         );
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("code_verifier".into(), "verifier".into())));
@@ -447,24 +514,19 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_token_delegates_to_client() {
-        let sf = Salesforce::new(
-            "mock.salesforce.com",
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let sf = make_salesforce(&mock);
 
-        let result = sf.revoke_token(&mock, "tok").await;
+        let result = sf.revoke_token("tok").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
         assert_eq!(
             requests[0].url,
-            "https://mock.salesforce.com/services/oauth2/revoke"
+            "https://login.salesforce.com/services/oauth2/revoke"
         );
     }
 }

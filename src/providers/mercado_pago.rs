@@ -7,6 +7,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://auth.mercadopago.com/authorization";
 const TOKEN_ENDPOINT: &str = "https://api.mercadopago.com/oauth/token";
 
+/// Configuration for creating a [`MercadoPago`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`MercadoPago::new`] which uses the built-in default client.
+pub struct MercadoPagoOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Mercado Pago](https://www.mercadopago.com/developers).
 ///
 /// Mercado Pago requires PKCE with the S256 challenge method for authorization requests.
@@ -29,7 +41,7 @@ const TOKEN_ENDPOINT: &str = "https://api.mercadopago.com/oauth/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{MercadoPago, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{MercadoPago, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let mercado_pago = MercadoPago::new(
@@ -45,29 +57,47 @@ const TOKEN_ENDPOINT: &str = "https://api.mercadopago.com/oauth/token";
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = mercado_pago
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = mercado_pago
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct MercadoPago {
+pub struct MercadoPago<'a, H: HttpClient> {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl MercadoPago {
-    /// Creates a new Mercado Pago OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> MercadoPago<'a, H> {
+    /// Creates a MercadoPago client from a [`MercadoPagoOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`MercadoPago::new`] instead.
+    pub fn from_options(options: MercadoPagoOptions<'a, H>) -> Self {
+        Self {
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            redirect_uri: options.redirect_uri,
+            http_client: options.http_client,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl MercadoPago<'static, reqwest::Client> {
+    /// Creates a new Mercado Pago OAuth 2.0 client using the default HTTP client.
     ///
     /// # Arguments
     ///
@@ -92,58 +122,16 @@ impl MercadoPago {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::from_options(MercadoPagoOptions {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             redirect_uri: redirect_uri.into(),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl MercadoPago {
-    /// Creates a Mercado Pago client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::MercadoPago;
-    ///
-    /// let mercado_pago = MercadoPago::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client_id: client_id.into(),
-            client_secret: client_secret.into(),
-            redirect_uri: redirect_uri.into(),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl MercadoPago {
+impl<'a, H: HttpClient> MercadoPago<'a, H> {
     /// Returns the provider name (`"MercadoPago"`).
     pub fn name(&self) -> &'static str {
         "MercadoPago"
@@ -198,8 +186,6 @@ impl MercadoPago {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -211,13 +197,12 @@ impl MercadoPago {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{MercadoPago, ReqwestClient};
+    /// # use arctic_oauth::MercadoPago;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let mercado_pago = MercadoPago::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = mercado_pago
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -226,7 +211,6 @@ impl MercadoPago {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
@@ -239,7 +223,7 @@ impl MercadoPago {
             ("code_verifier".to_string(), code_verifier.to_string()),
         ];
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 
     /// Refreshes an expired access token using a refresh token.
@@ -250,7 +234,6 @@ impl MercadoPago {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -261,24 +244,19 @@ impl MercadoPago {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{MercadoPago, ReqwestClient};
+    /// # use arctic_oauth::MercadoPago;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let mercado_pago = MercadoPago::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = mercado_pago
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         let body = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),
@@ -286,7 +264,7 @@ impl MercadoPago {
             ("client_secret".to_string(), self.client_secret.clone()),
         ];
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 }
 
@@ -339,22 +317,34 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_mercado_pago(http_client: &MockHttpClient) -> MercadoPago<'_, MockHttpClient> {
+        MercadoPago::from_options(MercadoPagoOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let mp = MercadoPago::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let mp = make_mercado_pago(&mock);
         assert_eq!(mp.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(mp.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
     fn name_returns_mercadopago() {
-        let mp = MercadoPago::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let mp = make_mercado_pago(&mock);
         assert_eq!(mp.name(), "MercadoPago");
     }
 
     #[test]
     fn authorization_url_has_no_scopes_param() {
-        let mp = MercadoPago::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let mp = make_mercado_pago(&mock);
         let url = mp.authorization_url("state123", "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -369,13 +359,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_body_credentials_with_pkce() {
-        let mp = MercadoPago::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -385,16 +368,17 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let mp = make_mercado_pago(&mock);
 
         let tokens = mp
-            .validate_authorization_code(&mock, "auth-code", "my-verifier")
+            .validate_authorization_code("auth-code", "my-verifier")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "mp-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, "https://api.mercadopago.com/oauth/token");
         assert!(get_header(&requests[0], "Authorization").is_none());
 
         let body = parse_form_body(&requests[0]);
@@ -407,13 +391,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_sends_body_credentials() {
-        let mp = MercadoPago::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -422,11 +399,9 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let mp = make_mercado_pago(&mock);
 
-        let tokens = mp
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = mp.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 

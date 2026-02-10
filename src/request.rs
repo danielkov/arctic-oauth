@@ -39,7 +39,7 @@ pub fn encode_basic_credentials(client_id: &str, client_secret: &str) -> String 
 /// - 400/401 with invalid body -> Err(Error::UnexpectedErrorBody { .. })
 /// - Other status -> Err(Error::UnexpectedResponse { .. })
 pub async fn send_token_request(
-    client: &(impl HttpClient + ?Sized),
+    client: &impl HttpClient,
     request: HttpRequest,
 ) -> Result<OAuth2Tokens, Error> {
     let response: HttpResponse = client.send(request).await?;

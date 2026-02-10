@@ -8,6 +8,36 @@ const AUTHORIZATION_ENDPOINT: &str = "https://twitter.com/i/oauth2/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.twitter.com/2/oauth2/token";
 const REVOCATION_ENDPOINT: &str = "https://api.twitter.com/2/oauth2/revoke";
 
+/// Configuration for creating a [`Twitter`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Twitter::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Twitter, TwitterOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let twitter = Twitter::from_options(TwitterOptions {
+///     client_id: "your-client-id".into(),
+///     client_secret: Some("your-client-secret".into()),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct TwitterOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [X (formerly Twitter)](https://docs.x.com/fundamentals/authentication/oauth-2-0/overview).
 ///
 /// X requires PKCE with the S256 challenge method for authorization requests.
@@ -39,7 +69,7 @@ const REVOCATION_ENDPOINT: &str = "https://api.twitter.com/2/oauth2/revoke";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Twitter, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Twitter, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let twitter = Twitter::new(
@@ -55,31 +85,70 @@ const REVOCATION_ENDPOINT: &str = "https://api.twitter.com/2/oauth2/revoke";
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = twitter
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = twitter
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// twitter.revoke_token(&http, tokens.access_token()?).await?;
+/// twitter.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Twitter {
+pub struct Twitter<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl Twitter {
-    /// Creates a new X (formerly Twitter) OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Twitter<'a, H> {
+    /// Creates a Twitter client from a [`TwitterOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Twitter::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Twitter, TwitterOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let twitter = Twitter::from_options(TwitterOptions {
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: Some("your-client-secret".into()),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: TwitterOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                options.client_secret,
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Twitter<'static, reqwest::Client> {
+    /// Creates a new X (formerly Twitter) OAuth 2.0 client using the default HTTP client.
+    ///
+    /// The endpoints are automatically set to production values.
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Twitter::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -112,16 +181,16 @@ impl Twitter {
         client_secret: Option<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, client_secret, Some(redirect_uri.into())),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
-        }
+        Self::from_options(TwitterOptions {
+            client_id: client_id.into(),
+            client_secret,
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-impl Twitter {
+impl<'a, H: HttpClient> Twitter<'a, H> {
     /// Returns the provider name (`"Twitter"`).
     pub fn name(&self) -> &'static str {
         "Twitter"
@@ -154,12 +223,7 @@ impl Twitter {
     /// let url = twitter.authorization_url(&state, &["tweet.read", "users.read"], &verifier);
     /// assert!(url.as_str().starts_with("https://twitter.com/"));
     /// ```
-    pub fn authorization_url(
-        &self,
-        state: &str,
-        scopes: &[&str],
-        code_verifier: &str,
-    ) -> url::Url {
+    pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
         self.client.create_authorization_url_with_pkce(
             &self.authorization_endpoint,
             state,
@@ -177,8 +241,6 @@ impl Twitter {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -190,13 +252,12 @@ impl Twitter {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Twitter, ReqwestClient};
+    /// # use arctic_oauth::Twitter;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let twitter = Twitter::new("client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = twitter
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -205,13 +266,12 @@ impl Twitter {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
             .validate_authorization_code(
-                http_client,
+                self.http_client,
                 &self.token_endpoint,
                 code,
                 Some(code_verifier),
@@ -227,7 +287,6 @@ impl Twitter {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -238,26 +297,21 @@ impl Twitter {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Twitter, ReqwestClient};
+    /// # use arctic_oauth::Twitter;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let twitter = Twitter::new("client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = twitter
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 
@@ -268,7 +322,6 @@ impl Twitter {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token or refresh token to revoke.
     ///
     /// # Errors
@@ -279,22 +332,17 @@ impl Twitter {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Twitter, ReqwestClient};
+    /// # use arctic_oauth::Twitter;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let twitter = Twitter::new("client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
-    /// twitter.revoke_token(&http, "token-to-revoke").await?;
+    /// twitter.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         self.client
-            .revoke_token(http_client, &self.revocation_endpoint, token)
+            .revoke_token(self.http_client, &self.revocation_endpoint, token)
             .await
     }
 }
@@ -340,9 +388,19 @@ mod tests {
             .collect()
     }
 
+    fn make_twitter(http_client: &MockHttpClient) -> Twitter<'_, MockHttpClient> {
+        Twitter::from_options(TwitterOptions {
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let twitter = Twitter::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let twitter = make_twitter(&mock);
         assert_eq!(twitter.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(twitter.token_endpoint, TOKEN_ENDPOINT);
         assert_eq!(twitter.revocation_endpoint, REVOCATION_ENDPOINT);
@@ -350,13 +408,15 @@ mod tests {
 
     #[test]
     fn name_returns_twitter() {
-        let twitter = Twitter::new("cid", None, "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let twitter = make_twitter(&mock);
         assert_eq!(twitter.name(), "Twitter");
     }
 
     #[test]
     fn authorization_url_includes_pkce() {
-        let twitter = Twitter::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let twitter = make_twitter(&mock);
         let url = twitter.authorization_url("state123", &["tweet.read"], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -367,7 +427,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_verifier() {
-        let twitter = Twitter::new("cid", Some("secret".into()), "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -376,9 +435,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let twitter = make_twitter(&mock);
 
         let tokens = twitter
-            .validate_authorization_code(&mock, "code", "verifier")
+            .validate_authorization_code("code", "verifier")
             .await
             .unwrap();
 
@@ -392,7 +452,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let twitter = Twitter::new("cid", Some("secret".into()), "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -401,20 +460,21 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let twitter = make_twitter(&mock);
 
-        let tokens = twitter.refresh_access_token(&mock, "rt").await.unwrap();
+        let tokens = twitter.refresh_access_token("rt").await.unwrap();
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
     }
 
     #[tokio::test]
     async fn revoke_token_delegates_to_client() {
-        let twitter = Twitter::new("cid", Some("secret".into()), "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let twitter = make_twitter(&mock);
 
-        let result = twitter.revoke_token(&mock, "tok").await;
+        let result = twitter.revoke_token("tok").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();

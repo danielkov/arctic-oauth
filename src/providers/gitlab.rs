@@ -3,6 +3,38 @@ use crate::error::Error;
 use crate::http::HttpClient;
 use crate::tokens::OAuth2Tokens;
 
+/// Configuration for creating a [`GitLab`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`GitLab::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{GitLab, GitLabOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let gitlab = GitLab::from_options(GitLabOptions {
+///     base_url: "https://gitlab.com".into(),
+///     client_id: "your-client-id".into(),
+///     client_secret: Some("your-client-secret".into()),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct GitLabOptions<'a, H: HttpClient> {
+    pub base_url: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [GitLab](https://docs.gitlab.com/ee/api/oauth2.html).
 ///
 /// GitLab follows the standard authorization code flow without requiring PKCE.
@@ -33,7 +65,7 @@ use crate::tokens::OAuth2Tokens;
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{GitLab, ReqwestClient, generate_state};
+/// use arctic_oauth::{GitLab, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// // For GitLab.com:
@@ -50,31 +82,71 @@ use crate::tokens::OAuth2Tokens;
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = gitlab
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = gitlab
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// gitlab.revoke_token(&http, tokens.access_token()?).await?;
+/// gitlab.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct GitLab {
+pub struct GitLab<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl GitLab {
+impl<'a, H: HttpClient> GitLab<'a, H> {
+    /// Creates a GitLab client from a [`GitLabOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`GitLab::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{GitLab, GitLabOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let gitlab = GitLab::from_options(GitLabOptions {
+    ///     base_url: "https://gitlab.com".into(),
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: Some("your-client-secret".into()),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: GitLabOptions<'a, H>) -> Self {
+        let base = options.base_url;
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                options.client_secret,
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: format!("{base}/oauth/authorize"),
+            token_endpoint: format!("{base}/oauth/token"),
+            revocation_endpoint: format!("{base}/oauth/revoke"),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl GitLab<'static, reqwest::Client> {
     /// Creates a new GitLab OAuth 2.0 client for a specific GitLab instance.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`GitLab::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -111,17 +183,17 @@ impl GitLab {
         client_secret: Option<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        let base = base_url.into();
-        Self {
-            client: OAuth2Client::new(client_id, client_secret, Some(redirect_uri.into())),
-            authorization_endpoint: format!("{base}/oauth/authorize"),
-            token_endpoint: format!("{base}/oauth/token"),
-            revocation_endpoint: format!("{base}/oauth/revoke"),
-        }
+        Self::from_options(GitLabOptions {
+            base_url: base_url.into(),
+            client_id: client_id.into(),
+            client_secret,
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-impl GitLab {
+impl<'a, H: HttpClient> GitLab<'a, H> {
     /// Returns the provider name (`"GitLab"`).
     pub fn name(&self) -> &'static str {
         "GitLab"
@@ -161,8 +233,6 @@ impl GitLab {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -173,26 +243,21 @@ impl GitLab {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{GitLab, ReqwestClient};
+    /// # use arctic_oauth::GitLab;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let gitlab = GitLab::new("https://gitlab.com", "client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = gitlab
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, None)
+            .validate_authorization_code(self.http_client, &self.token_endpoint, code, None)
             .await
     }
 
@@ -204,7 +269,6 @@ impl GitLab {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -215,26 +279,21 @@ impl GitLab {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{GitLab, ReqwestClient};
+    /// # use arctic_oauth::GitLab;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let gitlab = GitLab::new("https://gitlab.com", "client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = gitlab
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 
@@ -245,7 +304,6 @@ impl GitLab {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token or refresh token to revoke.
     ///
     /// # Errors
@@ -256,22 +314,17 @@ impl GitLab {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{GitLab, ReqwestClient};
+    /// # use arctic_oauth::GitLab;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let gitlab = GitLab::new("https://gitlab.com", "client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
-    /// gitlab.revoke_token(&http, "token-to-revoke").await?;
+    /// gitlab.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         self.client
-            .revoke_token(http_client, &self.revocation_endpoint, token)
+            .revoke_token(self.http_client, &self.revocation_endpoint, token)
             .await
     }
 }
@@ -325,14 +378,20 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_gitlab(http_client: &MockHttpClient) -> GitLab<'_, MockHttpClient> {
+        GitLab::from_options(GitLabOptions {
+            base_url: "https://gitlab.example.com".into(),
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_builds_endpoints_from_base_url() {
-        let gitlab = GitLab::new(
-            "https://gitlab.example.com",
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-        );
+        let mock = MockHttpClient::new(vec![]);
+        let gitlab = make_gitlab(&mock);
         assert_eq!(
             gitlab.authorization_endpoint,
             "https://gitlab.example.com/oauth/authorize"
@@ -349,13 +408,27 @@ mod tests {
 
     #[test]
     fn name_returns_gitlab() {
-        let gitlab = GitLab::new("https://gitlab.com", "cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let gitlab = GitLab::from_options(GitLabOptions {
+            base_url: "https://gitlab.com".into(),
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
         assert_eq!(gitlab.name(), "GitLab");
     }
 
     #[test]
     fn authorization_url_includes_standard_params() {
-        let gitlab = GitLab::new("https://gitlab.com", "cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let gitlab = GitLab::from_options(GitLabOptions {
+            base_url: "https://gitlab.com".into(),
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
         let url = gitlab.authorization_url("state123", &["read_user", "api"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -370,7 +443,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let gitlab = GitLab::new("https://mock", "cid", Some("secret".into()), "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -379,16 +451,17 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let gitlab = make_gitlab(&mock);
 
         let tokens = gitlab
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "gitlab-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/oauth/token");
+        assert_eq!(requests[0].url, "https://gitlab.example.com/oauth/token");
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "authorization_code".into())));
         assert!(body.contains(&("code".into(), "auth-code".into())));
@@ -397,7 +470,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_public_client() {
-        let gitlab = GitLab::new("https://mock", "cid", None, "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -406,9 +478,16 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let gitlab = GitLab::from_options(GitLabOptions {
+            base_url: "https://mock".into(),
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
 
         gitlab
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
@@ -420,7 +499,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let gitlab = GitLab::new("https://mock", "cid", Some("secret".into()), "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -429,28 +507,29 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let gitlab = make_gitlab(&mock);
 
-        let tokens = gitlab.refresh_access_token(&mock, "rt").await.unwrap();
+        let tokens = gitlab.refresh_access_token("rt").await.unwrap();
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/oauth/token");
+        assert_eq!(requests[0].url, "https://gitlab.example.com/oauth/token");
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "refresh_token".into())));
     }
 
     #[tokio::test]
     async fn revoke_token_delegates_to_client() {
-        let gitlab = GitLab::new("https://mock", "cid", Some("secret".into()), "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let gitlab = make_gitlab(&mock);
 
-        let result = gitlab.revoke_token(&mock, "tok").await;
+        let result = gitlab.revoke_token("tok").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/oauth/revoke");
+        assert_eq!(requests[0].url, "https://gitlab.example.com/oauth/revoke");
     }
 }

@@ -6,6 +6,17 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://bitbucket.org/site/oauth2/authorize";
 const TOKEN_ENDPOINT: &str = "https://bitbucket.org/site/oauth2/access_token";
 
+/// Configuration for creating a [`Bitbucket`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation.
+/// For the common case, use [`Bitbucket::new`] which uses the built-in default client.
+pub struct BitbucketOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Bitbucket](https://developer.atlassian.com/cloud/bitbucket/oauth-2/).
 ///
 /// Bitbucket does not require PKCE and does not use OAuth scopes in the authorization
@@ -37,7 +48,7 @@ const TOKEN_ENDPOINT: &str = "https://bitbucket.org/site/oauth2/access_token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Bitbucket, ReqwestClient, generate_state};
+/// use arctic_oauth::{Bitbucket, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let bitbucket = Bitbucket::new(
@@ -52,27 +63,47 @@ const TOKEN_ENDPOINT: &str = "https://bitbucket.org/site/oauth2/access_token";
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = bitbucket
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = bitbucket
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Bitbucket {
+pub struct Bitbucket<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Bitbucket {
-    /// Creates a new Bitbucket OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Bitbucket<'a, H> {
+    /// Creates a Bitbucket client from a [`BitbucketOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Bitbucket::new`] instead.
+    pub fn from_options(options: BitbucketOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Bitbucket<'static, reqwest::Client> {
+    /// Creates a new Bitbucket OAuth 2.0 client using the default HTTP client.
     ///
     /// # Arguments
     ///
@@ -97,62 +128,16 @@ impl Bitbucket {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+        Self::from_options(BitbucketOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Bitbucket {
-    /// Creates a Bitbucket client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Bitbucket;
-    ///
-    /// let bitbucket = Bitbucket::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Bitbucket {
+impl<'a, H: HttpClient> Bitbucket<'a, H> {
     /// Returns the provider name (`"Bitbucket"`).
     pub fn name(&self) -> &'static str {
         "Bitbucket"
@@ -194,8 +179,6 @@ impl Bitbucket {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -206,26 +189,21 @@ impl Bitbucket {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Bitbucket, ReqwestClient};
+    /// # use arctic_oauth::Bitbucket;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let bitbucket = Bitbucket::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = bitbucket
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, None)
+            .validate_authorization_code(self.http_client, &self.token_endpoint, code, None)
             .await
     }
 
@@ -236,7 +214,6 @@ impl Bitbucket {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -247,26 +224,21 @@ impl Bitbucket {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Bitbucket, ReqwestClient};
+    /// # use arctic_oauth::Bitbucket;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let bitbucket = Bitbucket::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = bitbucket
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 }
@@ -320,22 +292,34 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_bitbucket(http_client: &MockHttpClient) -> Bitbucket<'_, MockHttpClient> {
+        Bitbucket::from_options(BitbucketOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let bitbucket = Bitbucket::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let bitbucket = make_bitbucket(&mock);
         assert_eq!(bitbucket.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(bitbucket.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
     fn name_returns_bitbucket() {
-        let bitbucket = Bitbucket::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let bitbucket = make_bitbucket(&mock);
         assert_eq!(bitbucket.name(), "Bitbucket");
     }
 
     #[test]
     fn authorization_url_has_no_scope_param() {
-        let bitbucket = Bitbucket::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let bitbucket = make_bitbucket(&mock);
         let url = bitbucket.authorization_url("state123");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -348,13 +332,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let bitbucket = Bitbucket::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -364,28 +341,22 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let bitbucket = make_bitbucket(&mock);
 
         let tokens = bitbucket
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "bb-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
         assert!(get_header(&requests[0], "Authorization").is_some());
     }
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let bitbucket = Bitbucket::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -394,11 +365,9 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let bitbucket = make_bitbucket(&mock);
 
-        let tokens = bitbucket
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = bitbucket.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 

@@ -8,6 +8,18 @@ const AUTHORIZATION_ENDPOINT: &str = "https://polar.sh/oauth2/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.polar.sh/v1/oauth2/token";
 const REVOCATION_ENDPOINT: &str = "https://api.polar.sh/v1/oauth2/revoke";
 
+/// Configuration for creating a [`Polar`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Polar::new`] which uses the built-in default client.
+pub struct PolarOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Polar](https://polar.sh/docs/api-reference/oauth2/connect/authorize).
 ///
 /// Polar requires PKCE with the S256 challenge method on all authorization requests.
@@ -38,7 +50,7 @@ const REVOCATION_ENDPOINT: &str = "https://api.polar.sh/v1/oauth2/revoke";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Polar, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Polar, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let polar = Polar::new(
@@ -54,33 +66,55 @@ const REVOCATION_ENDPOINT: &str = "https://api.polar.sh/v1/oauth2/revoke";
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = polar
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = polar
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// polar.revoke_token(&http, tokens.access_token()?).await?;
+/// polar.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Polar {
+pub struct Polar<'a, H: HttpClient> {
     client_id: String,
     client_secret: Option<String>,
     redirect_uri: String,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl Polar {
+impl<'a, H: HttpClient> Polar<'a, H> {
+    /// Creates a Polar client from a [`PolarOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Polar::new`] instead.
+    pub fn from_options(options: PolarOptions<'a, H>) -> Self {
+        Self {
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            redirect_uri: options.redirect_uri,
+            http_client: options.http_client,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Polar<'static, reqwest::Client> {
     /// Creates a new Polar OAuth 2.0 client configured with production endpoints.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Polar::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -105,64 +139,16 @@ impl Polar {
         client_secret: Option<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::from_options(PolarOptions {
             client_id: client_id.into(),
             client_secret,
             redirect_uri: redirect_uri.into(),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
-        }
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Polar {
-    /// Creates a Polar client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Polar;
-    ///
-    /// let polar = Polar::with_endpoints(
-    ///     "test-client-id",
-    ///     Some("test-secret".into()),
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    ///     Some("http://localhost:8080/revoke"),
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: Option<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-        revocation_endpoint: Option<&str>,
-    ) -> Self {
-        Self {
-            client_id: client_id.into(),
-            client_secret,
-            redirect_uri: redirect_uri.into(),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-            revocation_endpoint: revocation_endpoint
-                .unwrap_or(REVOCATION_ENDPOINT)
-                .to_string(),
-        }
-    }
-}
-
-impl Polar {
+impl<'a, H: HttpClient> Polar<'a, H> {
     /// Returns the provider name (`"Polar"`).
     pub fn name(&self) -> &'static str {
         "Polar"
@@ -221,8 +207,6 @@ impl Polar {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -234,13 +218,12 @@ impl Polar {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Polar, ReqwestClient};
+    /// # use arctic_oauth::Polar;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let polar = Polar::new("client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = polar
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -249,7 +232,6 @@ impl Polar {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
@@ -264,7 +246,7 @@ impl Polar {
             body.push(("client_secret".to_string(), secret.clone()));
         }
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 
     /// Refreshes an expired access token using a refresh token.
@@ -275,7 +257,6 @@ impl Polar {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -286,24 +267,19 @@ impl Polar {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Polar, ReqwestClient};
+    /// # use arctic_oauth::Polar;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let polar = Polar::new("client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = polar
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         let mut body = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),
@@ -313,7 +289,7 @@ impl Polar {
             body.push(("client_secret".to_string(), secret.clone()));
         }
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 
     /// Revokes an access token or refresh token.
@@ -323,7 +299,6 @@ impl Polar {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token or refresh token to revoke.
     ///
     /// # Errors
@@ -334,20 +309,15 @@ impl Polar {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Polar, ReqwestClient};
+    /// # use arctic_oauth::Polar;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let polar = Polar::new("client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
-    /// polar.revoke_token(&http, "token-to-revoke").await?;
+    /// polar.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         let mut body = vec![
             ("token".to_string(), token.to_string()),
             ("client_id".to_string(), self.client_id.clone()),
@@ -356,7 +326,7 @@ impl Polar {
             body.push(("client_secret".to_string(), secret.clone()));
         }
         let request = create_oauth2_request(&self.revocation_endpoint, &body);
-        let response = http_client.send(request).await?;
+        let response = self.http_client.send(request).await?;
         match response.status {
             200 => Ok(()),
             status => Err(Error::UnexpectedResponse { status }),
@@ -413,9 +383,19 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_polar(http_client: &MockHttpClient) -> Polar<'_, MockHttpClient> {
+        Polar::from_options(PolarOptions {
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let polar = Polar::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let polar = make_polar(&mock);
         assert_eq!(polar.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(polar.token_endpoint, TOKEN_ENDPOINT);
         assert_eq!(polar.revocation_endpoint, REVOCATION_ENDPOINT);
@@ -423,13 +403,15 @@ mod tests {
 
     #[test]
     fn name_returns_polar() {
-        let polar = Polar::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let polar = make_polar(&mock);
         assert_eq!(polar.name(), "Polar");
     }
 
     #[test]
     fn authorization_url_includes_pkce_params() {
-        let polar = Polar::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let polar = make_polar(&mock);
         let url = polar.authorization_url("state123", &["read"], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -444,14 +426,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_with_secret() {
-        let polar = Polar::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -461,15 +435,17 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let polar = make_polar(&mock);
 
         let tokens = polar
-            .validate_authorization_code(&mock, "auth-code", "my-verifier")
+            .validate_authorization_code("auth-code", "my-verifier")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "polar-tok");
 
         let requests = mock.take_requests();
+        assert_eq!(requests[0].url, "https://api.polar.sh/v1/oauth2/token");
         assert!(get_header(&requests[0], "Authorization").is_none());
 
         let body = parse_form_body(&requests[0]);
@@ -482,14 +458,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_without_secret() {
-        let polar = Polar::with_endpoints(
-            "cid",
-            None,
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -498,9 +466,15 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let polar = Polar::from_options(PolarOptions {
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
 
         polar
-            .validate_authorization_code(&mock, "auth-code", "my-verifier")
+            .validate_authorization_code("auth-code", "my-verifier")
             .await
             .unwrap();
 
@@ -513,14 +487,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_with_secret() {
-        let polar = Polar::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -529,11 +495,9 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let polar = make_polar(&mock);
 
-        let tokens = polar
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = polar.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 
@@ -546,14 +510,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_without_secret() {
-        let polar = Polar::with_endpoints(
-            "cid",
-            None,
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -562,11 +518,14 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let polar = Polar::from_options(PolarOptions {
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
 
-        polar
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        polar.refresh_access_token("refresh-tok").await.unwrap();
 
         let requests = mock.take_requests();
         let body = parse_form_body(&requests[0]);
@@ -576,24 +535,17 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_token_with_secret() {
-        let polar = Polar::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let polar = make_polar(&mock);
 
-        let result = polar.revoke_token(&mock, "tok-to-revoke").await;
+        let result = polar.revoke_token("tok-to-revoke").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/revoke");
+        assert_eq!(requests[0].url, "https://api.polar.sh/v1/oauth2/revoke");
         assert!(get_header(&requests[0], "Authorization").is_none());
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("token".into(), "tok-to-revoke".into())));
@@ -603,20 +555,18 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_token_without_secret() {
-        let polar = Polar::with_endpoints(
-            "cid",
-            None,
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let polar = Polar::from_options(PolarOptions {
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
 
-        let result = polar.revoke_token(&mock, "tok-to-revoke").await;
+        let result = polar.revoke_token("tok-to-revoke").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
@@ -628,20 +578,13 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_token_non_200_returns_error() {
-        let polar = Polar::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 503,
             body: vec![],
         }]);
+        let polar = make_polar(&mock);
 
-        let result = polar.revoke_token(&mock, "tok").await;
+        let result = polar.revoke_token("tok").await;
         assert!(matches!(
             result,
             Err(Error::UnexpectedResponse { status: 503 })

@@ -6,6 +6,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://www.tumblr.com/oauth2/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.tumblr.com/v2/oauth2/token";
 
+/// Configuration for creating a [`Tumblr`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Tumblr::new`] which uses the built-in default client.
+pub struct TumblrOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Tumblr](https://www.tumblr.com/docs/en/api/v2#oauth2-authorization).
 ///
 /// Tumblr uses standard OAuth 2.0 authorization code flow without PKCE.
@@ -32,7 +44,7 @@ const TOKEN_ENDPOINT: &str = "https://api.tumblr.com/v2/oauth2/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Tumblr, ReqwestClient, generate_state};
+/// use arctic_oauth::{Tumblr, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let provider = Tumblr::new(
@@ -46,27 +58,50 @@ const TOKEN_ENDPOINT: &str = "https://api.tumblr.com/v2/oauth2/token";
 /// let url = provider.authorization_url(&state, &["basic", "write"]);
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = provider
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = provider
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Tumblr {
+pub struct Tumblr<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Tumblr {
+impl<'a, H: HttpClient> Tumblr<'a, H> {
+    /// Creates a Tumblr client from a [`TumblrOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Tumblr::new`] instead.
+    pub fn from_options(options: TumblrOptions<'a, H>) -> Self {
+        Self {
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                Some(options.redirect_uri),
+            ),
+            http_client: options.http_client,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Tumblr<'static, reqwest::Client> {
     /// Creates a new Tumblr OAuth 2.0 client configured with production endpoints.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Tumblr::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -91,62 +126,16 @@ impl Tumblr {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+        Self::from_options(TumblrOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Tumblr {
-    /// Creates a Tumblr client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Tumblr;
-    ///
-    /// let provider = Tumblr::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Tumblr {
+impl<'a, H: HttpClient> Tumblr<'a, H> {
     /// Returns the provider name (`"Tumblr"`).
     pub fn name(&self) -> &'static str {
         "Tumblr"
@@ -185,8 +174,6 @@ impl Tumblr {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -197,26 +184,21 @@ impl Tumblr {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Tumblr, ReqwestClient};
+    /// # use arctic_oauth::Tumblr;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let provider = Tumblr::new("client-id", "client-secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = provider
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, None)
+            .validate_authorization_code(self.http_client, &self.token_endpoint, code, None)
             .await
     }
 
@@ -228,7 +210,6 @@ impl Tumblr {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -239,26 +220,21 @@ impl Tumblr {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Tumblr, ReqwestClient};
+    /// # use arctic_oauth::Tumblr;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let provider = Tumblr::new("client-id", "client-secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = provider
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 }
@@ -304,35 +280,34 @@ mod tests {
             .collect()
     }
 
+    fn make_tumblr(http_client: &MockHttpClient) -> Tumblr<'_, MockHttpClient> {
+        Tumblr::from_options(TumblrOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let tumblr = Tumblr::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let tumblr = make_tumblr(&mock);
         assert_eq!(tumblr.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(tumblr.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
-    fn with_endpoints_overrides_urls() {
-        let tumblr = Tumblr::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
-        assert_eq!(tumblr.authorization_endpoint, "https://mock/authorize");
-        assert_eq!(tumblr.token_endpoint, "https://mock/token");
-    }
-
-    #[test]
     fn name_returns_correct_name() {
-        let tumblr = Tumblr::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let tumblr = make_tumblr(&mock);
         assert_eq!(tumblr.name(), "Tumblr");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let tumblr = Tumblr::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let tumblr = make_tumblr(&mock);
         let url = tumblr.authorization_url("state123", &["basic"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -346,13 +321,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let tumblr = Tumblr::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -362,9 +330,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let tumblr = make_tumblr(&mock);
 
         let tokens = tumblr
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
@@ -372,7 +341,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "authorization_code".into())));
@@ -382,13 +351,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let tumblr = Tumblr::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -397,17 +359,15 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let tumblr = make_tumblr(&mock);
 
-        let tokens = tumblr
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = tumblr.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "refresh_token".into())));

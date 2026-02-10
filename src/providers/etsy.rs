@@ -7,6 +7,34 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://www.etsy.com/oauth/connect";
 const TOKEN_ENDPOINT: &str = "https://api.etsy.com/v3/public/oauth/token";
 
+/// Configuration for creating an [`Etsy`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Etsy::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Etsy, EtsyOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let etsy = Etsy::from_options(EtsyOptions {
+///     client_id: "your-api-key".into(),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct EtsyOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Etsy](https://developers.etsy.com/documentation/essentials/authentication).
 ///
 /// Etsy requires PKCE with the S256 challenge method on all authorization requests.
@@ -36,7 +64,7 @@ const TOKEN_ENDPOINT: &str = "https://api.etsy.com/v3/public/oauth/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Etsy, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Etsy, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let etsy = Etsy::new(
@@ -51,27 +79,59 @@ const TOKEN_ENDPOINT: &str = "https://api.etsy.com/v3/public/oauth/token";
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = etsy
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = etsy
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Etsy {
+pub struct Etsy<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Etsy {
-    /// Creates a new Etsy OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Etsy<'a, H> {
+    /// Creates an Etsy client from an [`EtsyOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Etsy::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Etsy, EtsyOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let etsy = Etsy::from_options(EtsyOptions {
+    ///     client_id: "your-api-key".into(),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: EtsyOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(options.client_id, None, Some(options.redirect_uri)),
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Etsy<'static, reqwest::Client> {
+    /// Creates a new Etsy OAuth 2.0 client configured with production endpoints using the default HTTP client.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Etsy::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -89,56 +149,16 @@ impl Etsy {
     ///     "https://example.com/callback",
     /// );
     /// ```
-    pub fn new(
-        client_id: impl Into<String>,
-        redirect_uri: impl Into<String>,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, None, Some(redirect_uri.into())),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+    pub fn new(client_id: impl Into<String>, redirect_uri: impl Into<String>) -> Self {
+        Self::from_options(EtsyOptions {
+            client_id: client_id.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Etsy {
-    /// Creates an Etsy client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Etsy;
-    ///
-    /// let etsy = Etsy::with_endpoints(
-    ///     "test-api-key",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, None, Some(redirect_uri.into())),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Etsy {
+impl<'a, H: HttpClient> Etsy<'a, H> {
     /// Returns the provider name (`"Etsy"`).
     pub fn name(&self) -> &'static str {
         "Etsy"
@@ -188,8 +208,6 @@ impl Etsy {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -201,13 +219,12 @@ impl Etsy {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Etsy, ReqwestClient};
+    /// # use arctic_oauth::Etsy;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let etsy = Etsy::new("api-key", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = etsy
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -216,12 +233,16 @@ impl Etsy {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, Some(code_verifier))
+            .validate_authorization_code(
+                self.http_client,
+                &self.token_endpoint,
+                code,
+                Some(code_verifier),
+            )
             .await
     }
 
@@ -233,7 +254,6 @@ impl Etsy {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -244,26 +264,21 @@ impl Etsy {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Etsy, ReqwestClient};
+    /// # use arctic_oauth::Etsy;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let etsy = Etsy::new("api-key", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = etsy
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 }
@@ -317,35 +332,35 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_etsy(http_client: &MockHttpClient) -> Etsy<'_, MockHttpClient> {
+        Etsy::from_options(EtsyOptions {
+            client_id: "cid".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let etsy = Etsy::new("cid", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let etsy = make_etsy(&mock);
         assert_eq!(etsy.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(etsy.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
-    fn with_endpoints_overrides_urls() {
-        let etsy = Etsy::with_endpoints(
-            "cid",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
-        assert_eq!(etsy.authorization_endpoint, "https://mock/authorize");
-        assert_eq!(etsy.token_endpoint, "https://mock/token");
-    }
-
-    #[test]
     fn name_returns_etsy() {
-        let etsy = Etsy::new("cid", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let etsy = make_etsy(&mock);
         assert_eq!(etsy.name(), "Etsy");
     }
 
     #[test]
     fn authorization_url_includes_pkce_params() {
-        let etsy = Etsy::new("cid", "https://app/cb");
-        let url = etsy.authorization_url("state123", &["listings_r", "transactions_r"], "my-verifier");
+        let mock = MockHttpClient::new(vec![]);
+        let etsy = make_etsy(&mock);
+        let url =
+            etsy.authorization_url("state123", &["listings_r", "transactions_r"], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
         assert!(pairs.contains(&("response_type".into(), "code".into())));
@@ -359,7 +374,8 @@ mod tests {
 
     #[test]
     fn authorization_url_omits_scope_when_empty() {
-        let etsy = Etsy::new("cid", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let etsy = make_etsy(&mock);
         let url = etsy.authorization_url("state123", &[], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -371,12 +387,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_public_client_sends_client_id_in_body() {
-        let etsy = Etsy::with_endpoints(
-            "cid",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -386,16 +396,20 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let etsy = make_etsy(&mock);
 
         let tokens = etsy
-            .validate_authorization_code(&mock, "auth-code", "my-verifier")
+            .validate_authorization_code("auth-code", "my-verifier")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "etsy-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(
+            requests[0].url,
+            "https://api.etsy.com/v3/public/oauth/token"
+        );
         // Public client: no Authorization header
         assert!(get_header(&requests[0], "Authorization").is_none());
 
@@ -409,12 +423,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_public_client() {
-        let etsy = Etsy::with_endpoints(
-            "cid",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -423,11 +431,9 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let etsy = make_etsy(&mock);
 
-        let tokens = etsy
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = etsy.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 

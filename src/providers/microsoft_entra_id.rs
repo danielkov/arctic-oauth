@@ -4,6 +4,19 @@ use crate::pkce::{CodeChallengeMethod, create_code_challenge};
 use crate::request::{create_oauth2_request, encode_basic_credentials, send_token_request};
 use crate::tokens::OAuth2Tokens;
 
+/// Configuration for creating a [`MicrosoftEntraId`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`MicrosoftEntraId::new`] which uses the built-in default client.
+pub struct MicrosoftEntraIdOptions<'a, H: HttpClient> {
+    pub tenant: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Microsoft Entra ID](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow) (formerly Azure AD).
 ///
 /// Microsoft Entra ID requires PKCE with the S256 challenge method. This client supports both
@@ -36,7 +49,7 @@ use crate::tokens::OAuth2Tokens;
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{MicrosoftEntraId, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{MicrosoftEntraId, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// // Confidential client (with secret)
@@ -54,29 +67,50 @@ use crate::tokens::OAuth2Tokens;
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = entra_id
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = entra_id
-///     .refresh_access_token(&http, tokens.refresh_token()?, &["openid", "profile"])
+///     .refresh_access_token(tokens.refresh_token()?, &["openid", "profile"])
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct MicrosoftEntraId {
+pub struct MicrosoftEntraId<'a, H: HttpClient> {
     client_id: String,
     client_secret: Option<String>,
     redirect_uri: String,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl MicrosoftEntraId {
-    /// Creates a new Microsoft Entra ID OAuth 2.0 client.
+impl<'a, H: HttpClient> MicrosoftEntraId<'a, H> {
+    /// Creates a MicrosoftEntraId client from a [`MicrosoftEntraIdOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`MicrosoftEntraId::new`] instead.
+    pub fn from_options(options: MicrosoftEntraIdOptions<'a, H>) -> Self {
+        let tenant = options.tenant;
+        Self {
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            redirect_uri: options.redirect_uri,
+            http_client: options.http_client,
+            authorization_endpoint: format!(
+                "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
+            ),
+            token_endpoint: format!("https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl MicrosoftEntraId<'static, reqwest::Client> {
+    /// Creates a new Microsoft Entra ID OAuth 2.0 client using the default HTTP client.
     ///
     /// Endpoints are dynamically generated based on the tenant ID. Use `"common"` for
     /// multi-tenant applications or your specific tenant ID for single-tenant apps.
@@ -116,63 +150,17 @@ impl MicrosoftEntraId {
         client_secret: Option<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        let tenant = tenant.into();
-        Self {
+        Self::from_options(MicrosoftEntraIdOptions {
+            tenant: tenant.into(),
             client_id: client_id.into(),
             client_secret,
             redirect_uri: redirect_uri.into(),
-            authorization_endpoint: format!(
-                "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/authorize"
-            ),
-            token_endpoint: format!(
-                "https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token"
-            ),
-        }
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl MicrosoftEntraId {
-    /// Creates a Microsoft Entra ID client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::MicrosoftEntraId;
-    ///
-    /// let entra_id = MicrosoftEntraId::with_endpoints(
-    ///     "test-client-id",
-    ///     Some("test-secret".to_string()),
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: Option<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client_id: client_id.into(),
-            client_secret,
-            redirect_uri: redirect_uri.into(),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl MicrosoftEntraId {
+impl<'a, H: HttpClient> MicrosoftEntraId<'a, H> {
     /// Returns the provider name (`"Microsoft Entra ID"`).
     pub fn name(&self) -> &'static str {
         "Microsoft Entra ID"
@@ -209,12 +197,7 @@ impl MicrosoftEntraId {
     /// let url = entra_id.authorization_url(&state, &["openid", "profile"], &verifier);
     /// assert!(url.as_str().starts_with("https://login.microsoftonline.com/"));
     /// ```
-    pub fn authorization_url(
-        &self,
-        state: &str,
-        scopes: &[&str],
-        code_verifier: &str,
-    ) -> url::Url {
+    pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
         let code_challenge = create_code_challenge(code_verifier, CodeChallengeMethod::S256);
 
         let mut url = url::Url::parse(&self.authorization_endpoint)
@@ -249,8 +232,6 @@ impl MicrosoftEntraId {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -262,7 +243,7 @@ impl MicrosoftEntraId {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{MicrosoftEntraId, ReqwestClient};
+    /// # use arctic_oauth::MicrosoftEntraId;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let entra_id = MicrosoftEntraId::new(
     ///     "common",
@@ -270,10 +251,9 @@ impl MicrosoftEntraId {
     ///     Some("secret".to_string()),
     ///     "https://example.com/cb"
     /// );
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = entra_id
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -282,7 +262,6 @@ impl MicrosoftEntraId {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
@@ -312,7 +291,7 @@ impl MicrosoftEntraId {
             }
         };
 
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 
     /// Refreshes an expired access token using a refresh token.
@@ -326,7 +305,6 @@ impl MicrosoftEntraId {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     /// * `scopes` - Optional scopes for the new token. Pass an empty slice to use the original scopes.
     ///
@@ -338,7 +316,7 @@ impl MicrosoftEntraId {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{MicrosoftEntraId, ReqwestClient};
+    /// # use arctic_oauth::MicrosoftEntraId;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let entra_id = MicrosoftEntraId::new(
     ///     "common",
@@ -346,10 +324,9 @@ impl MicrosoftEntraId {
     ///     Some("secret".to_string()),
     ///     "https://example.com/cb"
     /// );
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = entra_id
-    ///     .refresh_access_token(&http, "stored-refresh-token", &["openid", "profile"])
+    ///     .refresh_access_token("stored-refresh-token", &["openid", "profile"])
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
@@ -358,7 +335,6 @@ impl MicrosoftEntraId {
     /// ```
     pub async fn refresh_access_token(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         refresh_token: &str,
         scopes: &[&str],
     ) -> Result<OAuth2Tokens, Error> {
@@ -390,7 +366,7 @@ impl MicrosoftEntraId {
             }
         };
 
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 }
 
@@ -456,9 +432,32 @@ mod tests {
         }
     }
 
+    fn make_entra_id_confidential(
+        http_client: &MockHttpClient,
+    ) -> MicrosoftEntraId<'_, MockHttpClient> {
+        MicrosoftEntraId::from_options(MicrosoftEntraIdOptions {
+            tenant: "my-tenant".into(),
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
+    fn make_entra_id_public(http_client: &MockHttpClient) -> MicrosoftEntraId<'_, MockHttpClient> {
+        MicrosoftEntraId::from_options(MicrosoftEntraIdOptions {
+            tenant: "my-tenant".into(),
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_builds_dynamic_endpoints_from_tenant() {
-        let provider = MicrosoftEntraId::new("my-tenant", "cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_entra_id_confidential(&mock);
         assert_eq!(
             provider.authorization_endpoint,
             "https://login.microsoftonline.com/my-tenant/oauth2/v2.0/authorize"
@@ -471,13 +470,15 @@ mod tests {
 
     #[test]
     fn name_returns_microsoft_entra_id() {
-        let provider = MicrosoftEntraId::new("tenant", "cid", None, "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_entra_id_public(&mock);
         assert_eq!(provider.name(), "Microsoft Entra ID");
     }
 
     #[test]
     fn authorization_url_includes_pkce_s256() {
-        let provider = MicrosoftEntraId::new("tenant", "cid", None, "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_entra_id_public(&mock);
         let url = provider.authorization_url("state123", &["openid", "profile"], "test-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -496,7 +497,8 @@ mod tests {
 
     #[test]
     fn authorization_url_omits_scope_when_empty() {
-        let provider = MicrosoftEntraId::new("tenant", "cid", None, "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_entra_id_public(&mock);
         let url = provider.authorization_url("state123", &[], "test-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -505,17 +507,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_code_confidential_uses_basic_auth() {
-        let provider = MicrosoftEntraId::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![success_response()]);
+        let provider = make_entra_id_confidential(&mock);
 
         let tokens = provider
-            .validate_authorization_code(&mock, "auth-code", "verifier")
+            .validate_authorization_code("auth-code", "verifier")
             .await
             .unwrap();
 
@@ -523,7 +519,10 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(
+            requests[0].url,
+            "https://login.microsoftonline.com/my-tenant/oauth2/v2.0/token"
+        );
 
         // Confidential: should have Basic Auth header
         let auth = get_header(&requests[0], "Authorization").unwrap();
@@ -544,17 +543,11 @@ mod tests {
 
     #[tokio::test]
     async fn validate_code_public_uses_body_and_origin() {
-        let provider = MicrosoftEntraId::with_endpoints(
-            "cid",
-            None,
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![success_response()]);
+        let provider = make_entra_id_public(&mock);
 
         let tokens = provider
-            .validate_authorization_code(&mock, "auth-code", "verifier")
+            .validate_authorization_code("auth-code", "verifier")
             .await
             .unwrap();
 
@@ -579,17 +572,11 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_confidential_uses_basic_auth() {
-        let provider = MicrosoftEntraId::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![success_response()]);
+        let provider = make_entra_id_confidential(&mock);
 
         provider
-            .refresh_access_token(&mock, "rt-123", &["openid"])
+            .refresh_access_token("rt-123", &["openid"])
             .await
             .unwrap();
 
@@ -612,17 +599,11 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_public_uses_body_and_origin() {
-        let provider = MicrosoftEntraId::with_endpoints(
-            "cid",
-            None,
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![success_response()]);
+        let provider = make_entra_id_public(&mock);
 
         provider
-            .refresh_access_token(&mock, "rt-123", &["openid", "profile"])
+            .refresh_access_token("rt-123", &["openid", "profile"])
             .await
             .unwrap();
 
@@ -645,35 +626,13 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_omits_scope_when_empty() {
-        let provider = MicrosoftEntraId::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![success_response()]);
+        let provider = make_entra_id_confidential(&mock);
 
-        provider
-            .refresh_access_token(&mock, "rt-123", &[])
-            .await
-            .unwrap();
+        provider.refresh_access_token("rt-123", &[]).await.unwrap();
 
         let requests = mock.take_requests();
         let body = parse_form_body(&requests[0]);
         assert!(!body.iter().any(|(k, _)| k == "scope"));
-    }
-
-    #[test]
-    fn with_endpoints_overrides_urls() {
-        let provider = MicrosoftEntraId::with_endpoints(
-            "cid",
-            None,
-            "https://app/cb",
-            "https://custom/authorize",
-            "https://custom/token",
-        );
-        assert_eq!(provider.authorization_endpoint, "https://custom/authorize");
-        assert_eq!(provider.token_endpoint, "https://custom/token");
     }
 }

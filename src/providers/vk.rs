@@ -6,6 +6,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://oauth.vk.com/authorize";
 const TOKEN_ENDPOINT: &str = "https://oauth.vk.com/access_token";
 
+/// Configuration for creating a [`VK`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`VK::new`] which uses the built-in default client.
+pub struct VKOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [VK (VKontakte)](https://dev.vk.com/api/access-token/getting-started).
 ///
 /// VK does not require PKCE for authorization requests. This client supports the standard
@@ -34,7 +46,7 @@ const TOKEN_ENDPOINT: &str = "https://oauth.vk.com/access_token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{VK, ReqwestClient, generate_state};
+/// use arctic_oauth::{VK, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let vk = VK::new(
@@ -49,24 +61,45 @@ const TOKEN_ENDPOINT: &str = "https://oauth.vk.com/access_token";
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = vk
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 /// # Ok(())
 /// # }
 /// ```
-pub struct VK {
+pub struct VK<'a, H: HttpClient> {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
     authorization_endpoint: String,
     token_endpoint: String,
+    http_client: &'a H,
 }
 
-impl VK {
+impl<'a, H: HttpClient> VK<'a, H> {
+    /// Creates a VK client from a [`VKOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`VK::new`] instead.
+    pub fn from_options(options: VKOptions<'a, H>) -> Self {
+        Self {
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            redirect_uri: options.redirect_uri,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            http_client: options.http_client,
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl VK<'static, reqwest::Client> {
     /// Creates a new VK OAuth 2.0 client configured with production endpoints.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`VK::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -91,58 +124,16 @@ impl VK {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::from_options(VKOptions {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             redirect_uri: redirect_uri.into(),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl VK {
-    /// Creates a VK client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::VK;
-    ///
-    /// let vk = VK::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client_id: client_id.into(),
-            client_secret: client_secret.into(),
-            redirect_uri: redirect_uri.into(),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl VK {
+impl<'a, H: HttpClient> VK<'a, H> {
     /// Returns the provider name (`"VK"`).
     pub fn name(&self) -> &'static str {
         "VK"
@@ -198,8 +189,6 @@ impl VK {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -210,24 +199,19 @@ impl VK {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{VK, ReqwestClient};
+    /// # use arctic_oauth::VK;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let vk = VK::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = vk
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         let body = vec![
             ("grant_type".to_string(), "authorization_code".to_string()),
             ("code".to_string(), code.to_string()),
@@ -237,7 +221,7 @@ impl VK {
         ];
 
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 }
 
@@ -282,6 +266,15 @@ mod tests {
             .collect()
     }
 
+    fn make_vk(http_client: &MockHttpClient) -> VK<'_, MockHttpClient> {
+        VK::from_options(VKOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     fn get_header<'a>(request: &'a HttpRequest, name: &str) -> Option<&'a str> {
         request
             .headers
@@ -292,20 +285,23 @@ mod tests {
 
     #[test]
     fn new_sets_production_endpoints() {
-        let provider = VK::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_vk(&mock);
         assert_eq!(provider.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(provider.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
     fn name_returns_vk() {
-        let provider = VK::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_vk(&mock);
         assert_eq!(provider.name(), "VK");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let provider = VK::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_vk(&mock);
         let url = provider.authorization_url("state123", &["friends", "photos"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -318,7 +314,8 @@ mod tests {
 
     #[test]
     fn authorization_url_omits_scope_when_empty() {
-        let provider = VK::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let provider = make_vk(&mock);
         let url = provider.authorization_url("state123", &[]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -327,13 +324,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_body_credentials() {
-        let provider = VK::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -342,9 +332,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let provider = make_vk(&mock);
 
         let tokens = provider
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
@@ -352,7 +343,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         // No Authorization header (body credentials, not Basic Auth)
         assert!(get_header(&requests[0], "Authorization").is_none());

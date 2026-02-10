@@ -7,6 +7,17 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://lichess.org/oauth";
 const TOKEN_ENDPOINT: &str = "https://lichess.org/api/token";
 
+/// Configuration for creating a [`Lichess`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Lichess::new`] which uses the built-in default client.
+pub struct LichessOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Lichess](https://lichess.org/api).
 ///
 /// Lichess requires PKCE with the S256 challenge method on all authorization requests.
@@ -35,7 +46,7 @@ const TOKEN_ENDPOINT: &str = "https://lichess.org/api/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Lichess, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Lichess, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let lichess = Lichess::new(
@@ -50,24 +61,42 @@ const TOKEN_ENDPOINT: &str = "https://lichess.org/api/token";
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = lichess
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 /// # Ok(())
 /// # }
 /// ```
-pub struct Lichess {
+pub struct Lichess<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Lichess {
+impl<'a, H: HttpClient> Lichess<'a, H> {
+    /// Creates a Lichess client from a [`LichessOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Lichess::new`] instead.
+    pub fn from_options(options: LichessOptions<'a, H>) -> Self {
+        Self {
+            client: OAuth2Client::new(options.client_id, None, Some(options.redirect_uri)),
+            http_client: options.http_client,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Lichess<'static, reqwest::Client> {
     /// Creates a new Lichess OAuth 2.0 client configured with production endpoints.
     ///
     /// Note: Lichess is a public client and does not require a client secret.
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Lichess::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -85,56 +114,16 @@ impl Lichess {
     ///     "https://example.com/callback",
     /// );
     /// ```
-    pub fn new(
-        client_id: impl Into<String>,
-        redirect_uri: impl Into<String>,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, None, Some(redirect_uri.into())),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+    pub fn new(client_id: impl Into<String>, redirect_uri: impl Into<String>) -> Self {
+        Self::from_options(LichessOptions {
+            client_id: client_id.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Lichess {
-    /// Creates a Lichess client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Lichess;
-    ///
-    /// let lichess = Lichess::with_endpoints(
-    ///     "test-client-id",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, None, Some(redirect_uri.into())),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Lichess {
+impl<'a, H: HttpClient> Lichess<'a, H> {
     /// Returns the provider name (`"Lichess"`).
     pub fn name(&self) -> &'static str {
         "Lichess"
@@ -185,8 +174,6 @@ impl Lichess {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -198,13 +185,12 @@ impl Lichess {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Lichess, ReqwestClient};
+    /// # use arctic_oauth::Lichess;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let lichess = Lichess::new("client-id", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = lichess
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -213,12 +199,16 @@ impl Lichess {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, Some(code_verifier))
+            .validate_authorization_code(
+                self.http_client,
+                &self.token_endpoint,
+                code,
+                Some(code_verifier),
+            )
             .await
     }
 }
@@ -272,35 +262,38 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_lichess(http_client: &MockHttpClient) -> Lichess<'_, MockHttpClient> {
+        Lichess::from_options(LichessOptions {
+            client_id: "cid".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let lichess = Lichess::new("cid", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let lichess = make_lichess(&mock);
         assert_eq!(lichess.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(lichess.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
-    fn with_endpoints_overrides_urls() {
-        let lichess = Lichess::with_endpoints(
-            "cid",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
-        assert_eq!(lichess.authorization_endpoint, "https://mock/authorize");
-        assert_eq!(lichess.token_endpoint, "https://mock/token");
-    }
-
-    #[test]
     fn name_returns_lichess() {
-        let lichess = Lichess::new("cid", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let lichess = make_lichess(&mock);
         assert_eq!(lichess.name(), "Lichess");
     }
 
     #[test]
     fn authorization_url_includes_pkce_params() {
-        let lichess = Lichess::new("cid", "https://app/cb");
-        let url = lichess.authorization_url("state123", &["challenge:read", "puzzle:read"], "my-verifier");
+        let mock = MockHttpClient::new(vec![]);
+        let lichess = make_lichess(&mock);
+        let url = lichess.authorization_url(
+            "state123",
+            &["challenge:read", "puzzle:read"],
+            "my-verifier",
+        );
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
         assert!(pairs.contains(&("response_type".into(), "code".into())));
@@ -314,7 +307,8 @@ mod tests {
 
     #[test]
     fn authorization_url_omits_scope_when_empty() {
-        let lichess = Lichess::new("cid", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let lichess = make_lichess(&mock);
         let url = lichess.authorization_url("state123", &[], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -325,12 +319,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_public_client_sends_client_id_in_body() {
-        let lichess = Lichess::with_endpoints(
-            "cid",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -340,16 +328,17 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let lichess = make_lichess(&mock);
 
         let tokens = lichess
-            .validate_authorization_code(&mock, "auth-code", "my-verifier")
+            .validate_authorization_code("auth-code", "my-verifier")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "lichess-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, "https://lichess.org/api/token");
         // Public client: no Authorization header
         assert!(get_header(&requests[0], "Authorization").is_none());
 

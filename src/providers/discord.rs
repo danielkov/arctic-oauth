@@ -8,6 +8,36 @@ const AUTHORIZATION_ENDPOINT: &str = "https://discord.com/oauth2/authorize";
 const TOKEN_ENDPOINT: &str = "https://discord.com/api/oauth2/token";
 const REVOCATION_ENDPOINT: &str = "https://discord.com/api/oauth2/token/revoke";
 
+/// Configuration for creating a [`Discord`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Discord::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Discord, DiscordOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let discord = Discord::from_options(DiscordOptions {
+///     client_id: "your-client-id".into(),
+///     client_secret: Some("your-client-secret".into()),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct DiscordOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Discord](https://discord.com/developers/docs/topics/oauth2).
 ///
 /// Discord supports optional PKCE with the S256 challenge method for enhanced security.
@@ -38,7 +68,7 @@ const REVOCATION_ENDPOINT: &str = "https://discord.com/api/oauth2/token/revoke";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Discord, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Discord, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let discord = Discord::new(
@@ -54,31 +84,69 @@ const REVOCATION_ENDPOINT: &str = "https://discord.com/api/oauth2/token/revoke";
 /// // Store `state` and optionally `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = discord
-///     .validate_authorization_code(&http, "authorization-code", Some(&code_verifier))
+///     .validate_authorization_code("authorization-code", Some(&code_verifier))
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = discord
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// discord.revoke_token(&http, tokens.access_token()?).await?;
+/// discord.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Discord {
+pub struct Discord<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl Discord {
-    /// Creates a new Discord OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Discord<'a, H> {
+    /// Creates a Discord client from a [`DiscordOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Discord::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Discord, DiscordOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let discord = Discord::from_options(DiscordOptions {
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: Some("your-client-secret".into()),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: DiscordOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                options.client_secret,
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Discord<'static, reqwest::Client> {
+    /// Creates a new Discord OAuth 2.0 client using the default HTTP client.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Discord::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -112,60 +180,16 @@ impl Discord {
         client_secret: Option<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, client_secret, Some(redirect_uri.into())),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
-        }
+        Self::from_options(DiscordOptions {
+            client_id: client_id.into(),
+            client_secret,
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Discord {
-    /// Creates a Discord client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Discord;
-    ///
-    /// let discord = Discord::with_endpoints(
-    ///     "test-client-id",
-    ///     Some("test-secret".to_string()),
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    ///     Some("http://localhost:8080/revoke"),
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: Option<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-        revocation_endpoint: Option<&str>,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, client_secret, Some(redirect_uri.into())),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-            revocation_endpoint: revocation_endpoint
-                .unwrap_or(REVOCATION_ENDPOINT)
-                .to_string(),
-        }
-    }
-}
-
-impl Discord {
+impl<'a, H: HttpClient> Discord<'a, H> {
     /// Returns the provider name (`"Discord"`).
     pub fn name(&self) -> &'static str {
         "Discord"
@@ -234,8 +258,6 @@ impl Discord {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///   Pass `None` if PKCE was not used.
@@ -248,13 +270,12 @@ impl Discord {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Discord, ReqwestClient};
+    /// # use arctic_oauth::Discord;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let discord = Discord::new("client-id", Some("secret".to_string()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = discord
-    ///     .validate_authorization_code(&http, "the-auth-code", Some("the-code-verifier"))
+    ///     .validate_authorization_code("the-auth-code", Some("the-code-verifier"))
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -263,12 +284,16 @@ impl Discord {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: Option<&str>,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, code_verifier)
+            .validate_authorization_code(
+                self.http_client,
+                &self.token_endpoint,
+                code,
+                code_verifier,
+            )
             .await
     }
 
@@ -280,7 +305,6 @@ impl Discord {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -291,26 +315,21 @@ impl Discord {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Discord, ReqwestClient};
+    /// # use arctic_oauth::Discord;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let discord = Discord::new("client-id", Some("secret".to_string()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = discord
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 
@@ -320,7 +339,6 @@ impl Discord {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token or refresh token to revoke.
     ///
     /// # Errors
@@ -331,22 +349,17 @@ impl Discord {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Discord, ReqwestClient};
+    /// # use arctic_oauth::Discord;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let discord = Discord::new("client-id", Some("secret".to_string()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
-    /// discord.revoke_token(&http, "token-to-revoke").await?;
+    /// discord.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         self.client
-            .revoke_token(http_client, &self.revocation_endpoint, token)
+            .revoke_token(self.http_client, &self.revocation_endpoint, token)
             .await
     }
 }
@@ -400,57 +413,47 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_discord(http_client: &MockHttpClient) -> Discord<'_, MockHttpClient> {
+        Discord::from_options(DiscordOptions {
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let discord = Discord::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let discord = make_discord(&mock);
         assert_eq!(discord.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(discord.token_endpoint, TOKEN_ENDPOINT);
         assert_eq!(discord.revocation_endpoint, REVOCATION_ENDPOINT);
     }
 
     #[test]
-    fn with_endpoints_overrides_urls() {
-        let discord = Discord::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
-        assert_eq!(discord.authorization_endpoint, "https://mock/authorize");
-        assert_eq!(discord.token_endpoint, "https://mock/token");
-        assert_eq!(discord.revocation_endpoint, "https://mock/revoke");
-    }
-
-    #[test]
-    fn with_endpoints_defaults_revocation() {
-        let discord = Discord::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
-        assert_eq!(discord.revocation_endpoint, REVOCATION_ENDPOINT);
-    }
-
-    #[test]
     fn name_returns_discord() {
-        let discord = Discord::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let discord = make_discord(&mock);
         assert_eq!(discord.name(), "Discord");
     }
 
     #[test]
     fn new_with_no_secret_creates_public_client() {
-        let discord = Discord::new("cid", None, "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let discord = Discord::from_options(DiscordOptions {
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
         assert_eq!(discord.name(), "Discord");
     }
 
     #[test]
     fn authorization_url_without_pkce() {
-        let discord = Discord::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let discord = make_discord(&mock);
         let url = discord
             .authorization_url("state123", &["identify", "email"], None)
             .unwrap();
@@ -468,7 +471,8 @@ mod tests {
 
     #[test]
     fn authorization_url_with_pkce() {
-        let discord = Discord::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let discord = make_discord(&mock);
         let url = discord
             .authorization_url("state123", &["identify", "email"], Some("my-verifier"))
             .unwrap();
@@ -485,14 +489,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let discord = Discord::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -502,9 +498,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let discord = make_discord(&mock);
 
         let tokens = discord
-            .validate_authorization_code(&mock, "auth-code", Some("verifier"))
+            .validate_authorization_code("auth-code", Some("verifier"))
             .await
             .unwrap();
 
@@ -512,7 +509,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "authorization_code".into())));
@@ -522,14 +519,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_without_pkce() {
-        let discord = Discord::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -539,9 +528,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let discord = make_discord(&mock);
 
         let tokens = discord
-            .validate_authorization_code(&mock, "auth-code", None)
+            .validate_authorization_code("auth-code", None)
             .await
             .unwrap();
 
@@ -556,14 +546,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_public_client_sends_client_id_in_body() {
-        let discord = Discord::with_endpoints(
-            "cid",
-            None,
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -573,9 +555,15 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let discord = Discord::from_options(DiscordOptions {
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client: &mock,
+        });
 
         discord
-            .validate_authorization_code(&mock, "auth-code", Some("verifier"))
+            .validate_authorization_code("auth-code", Some("verifier"))
             .await
             .unwrap();
 
@@ -589,14 +577,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let discord = Discord::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -605,17 +585,15 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let discord = make_discord(&mock);
 
-        let tokens = discord
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = discord.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "refresh_token".into())));
@@ -624,25 +602,18 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_token_delegates_to_client() {
-        let discord = Discord::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let discord = make_discord(&mock);
 
-        let result = discord.revoke_token(&mock, "tok-to-revoke").await;
+        let result = discord.revoke_token("tok-to-revoke").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/revoke");
+        assert_eq!(requests[0].url, REVOCATION_ENDPOINT);
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("token".into(), "tok-to-revoke".into())));
@@ -650,20 +621,13 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_token_non_200_returns_error() {
-        let discord = Discord::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 503,
             body: vec![],
         }]);
+        let discord = make_discord(&mock);
 
-        let result = discord.revoke_token(&mock, "tok").await;
+        let result = discord.revoke_token("tok").await;
         assert!(matches!(
             result,
             Err(Error::UnexpectedResponse { status: 503 })

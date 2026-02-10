@@ -6,6 +6,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://anilist.co/api/v2/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://anilist.co/api/v2/oauth/token";
 
+/// Configuration for creating an [`AniList`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`AniList::new`] which uses the built-in default client.
+pub struct AniListOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [AniList](https://anilist.gitbook.io/anilist-apiv2-docs/docs/guide/auth/index).
 ///
 /// AniList does not require PKCE and does not use OAuth scopes. This client supports
@@ -25,7 +37,7 @@ const TOKEN_ENDPOINT: &str = "https://anilist.co/api/v2/oauth/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{AniList, ReqwestClient, generate_state};
+/// use arctic_oauth::{AniList, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let anilist = AniList::new(
@@ -40,22 +52,42 @@ const TOKEN_ENDPOINT: &str = "https://anilist.co/api/v2/oauth/token";
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = anilist
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 /// # Ok(())
 /// # }
 /// ```
-pub struct AniList {
+pub struct AniList<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl AniList {
-    /// Creates a new AniList OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> AniList<'a, H> {
+    /// Creates an AniList client from an [`AniListOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`AniList::new`] instead.
+    pub fn from_options(options: AniListOptions<'a, H>) -> Self {
+        Self {
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                Some(options.redirect_uri),
+            ),
+            http_client: options.http_client,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl AniList<'static, reqwest::Client> {
+    /// Creates a new AniList OAuth 2.0 client using the default HTTP client.
     ///
     /// # Arguments
     ///
@@ -80,62 +112,16 @@ impl AniList {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+        Self::from_options(AniListOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl AniList {
-    /// Creates an AniList client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::AniList;
-    ///
-    /// let anilist = AniList::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl AniList {
+impl<'a, H: HttpClient> AniList<'a, H> {
     /// Returns the provider name (`"AniList"`).
     pub fn name(&self) -> &'static str {
         "AniList"
@@ -174,8 +160,6 @@ impl AniList {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -186,26 +170,21 @@ impl AniList {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{AniList, ReqwestClient};
+    /// # use arctic_oauth::AniList;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let anilist = AniList::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = anilist
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, None)
+            .validate_authorization_code(self.http_client, &self.token_endpoint, code, None)
             .await
     }
 }
@@ -251,35 +230,34 @@ mod tests {
             .collect()
     }
 
+    fn make_anilist(http_client: &MockHttpClient) -> AniList<'_, MockHttpClient> {
+        AniList::from_options(AniListOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let anilist = AniList::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let anilist = make_anilist(&mock);
         assert_eq!(anilist.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(anilist.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
-    fn with_endpoints_overrides_urls() {
-        let anilist = AniList::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
-        assert_eq!(anilist.authorization_endpoint, "https://mock/authorize");
-        assert_eq!(anilist.token_endpoint, "https://mock/token");
-    }
-
-    #[test]
     fn name_returns_correct_name() {
-        let anilist = AniList::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let anilist = make_anilist(&mock);
         assert_eq!(anilist.name(), "AniList");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let anilist = AniList::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let anilist = make_anilist(&mock);
         let url = anilist.authorization_url("state123");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -293,13 +271,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let anilist = AniList::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -309,9 +280,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let anilist = make_anilist(&mock);
 
         let tokens = anilist
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
@@ -319,7 +291,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "authorization_code".into())));

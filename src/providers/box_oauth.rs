@@ -7,6 +7,17 @@ const AUTHORIZATION_ENDPOINT: &str = "https://account.box.com/api/oauth2/authori
 const TOKEN_ENDPOINT: &str = "https://api.box.com/oauth2/token";
 const REVOCATION_ENDPOINT: &str = "https://api.box.com/oauth2/revoke";
 
+/// Configuration for creating a [`BoxOAuth`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation.
+/// For the common case, use [`BoxOAuth::new`] which uses the built-in default client.
+pub struct BoxOAuthOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Box](https://developer.box.com/guides/authentication/oauth2/).
 ///
 /// Box does not require PKCE. This client supports the authorization code flow including
@@ -35,7 +46,7 @@ const REVOCATION_ENDPOINT: &str = "https://api.box.com/oauth2/revoke";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{BoxOAuth, ReqwestClient, generate_state};
+/// use arctic_oauth::{BoxOAuth, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let box_oauth = BoxOAuth::new(
@@ -49,33 +60,52 @@ const REVOCATION_ENDPOINT: &str = "https://api.box.com/oauth2/revoke";
 /// let url = box_oauth.authorization_url(&state, &[]);
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = box_oauth
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = box_oauth
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// box_oauth.revoke_token(&http, tokens.access_token()?).await?;
+/// box_oauth.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct BoxOAuth {
+pub struct BoxOAuth<'a, H: HttpClient> {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl BoxOAuth {
-    /// Creates a new Box OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> BoxOAuth<'a, H> {
+    /// Creates a BoxOAuth client from a [`BoxOAuthOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`BoxOAuth::new`] instead.
+    pub fn from_options(options: BoxOAuthOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            redirect_uri: options.redirect_uri,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl BoxOAuth<'static, reqwest::Client> {
+    /// Creates a new Box OAuth 2.0 client using the default HTTP client.
     ///
     /// # Arguments
     ///
@@ -100,64 +130,16 @@ impl BoxOAuth {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::from_options(BoxOAuthOptions {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             redirect_uri: redirect_uri.into(),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
-        }
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl BoxOAuth {
-    /// Creates a Box client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::BoxOAuth;
-    ///
-    /// let box_oauth = BoxOAuth::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    ///     Some("http://localhost:8080/revoke"),
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-        revocation_endpoint: Option<&str>,
-    ) -> Self {
-        Self {
-            client_id: client_id.into(),
-            client_secret: client_secret.into(),
-            redirect_uri: redirect_uri.into(),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-            revocation_endpoint: revocation_endpoint
-                .unwrap_or(REVOCATION_ENDPOINT)
-                .to_string(),
-        }
-    }
-}
-
-impl BoxOAuth {
+impl<'a, H: HttpClient> BoxOAuth<'a, H> {
     /// Returns the provider name (`"Box"`).
     pub fn name(&self) -> &'static str {
         "Box"
@@ -209,8 +191,6 @@ impl BoxOAuth {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -221,24 +201,19 @@ impl BoxOAuth {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{BoxOAuth, ReqwestClient};
+    /// # use arctic_oauth::BoxOAuth;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let box_oauth = BoxOAuth::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = box_oauth
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         let body = vec![
             ("grant_type".to_string(), "authorization_code".to_string()),
             ("code".to_string(), code.to_string()),
@@ -247,7 +222,7 @@ impl BoxOAuth {
             ("client_secret".to_string(), self.client_secret.clone()),
         ];
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 
     /// Refreshes an expired access token using a refresh token.
@@ -258,7 +233,6 @@ impl BoxOAuth {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -269,24 +243,19 @@ impl BoxOAuth {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{BoxOAuth, ReqwestClient};
+    /// # use arctic_oauth::BoxOAuth;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let box_oauth = BoxOAuth::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = box_oauth
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         let body = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),
@@ -294,7 +263,7 @@ impl BoxOAuth {
             ("client_secret".to_string(), self.client_secret.clone()),
         ];
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 
     /// Revokes an access token or refresh token.
@@ -303,7 +272,6 @@ impl BoxOAuth {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token or refresh token to revoke.
     ///
     /// # Errors
@@ -314,27 +282,22 @@ impl BoxOAuth {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{BoxOAuth, ReqwestClient};
+    /// # use arctic_oauth::BoxOAuth;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let box_oauth = BoxOAuth::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
-    /// box_oauth.revoke_token(&http, "token-to-revoke").await?;
+    /// box_oauth.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         let body = vec![
             ("token".to_string(), token.to_string()),
             ("client_id".to_string(), self.client_id.clone()),
             ("client_secret".to_string(), self.client_secret.clone()),
         ];
         let request = create_oauth2_request(&self.revocation_endpoint, &body);
-        let response = http_client.send(request).await?;
+        let response = self.http_client.send(request).await?;
         match response.status {
             200 => Ok(()),
             status => Err(Error::UnexpectedResponse { status }),
@@ -391,9 +354,19 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_box_oauth(http_client: &MockHttpClient) -> BoxOAuth<'_, MockHttpClient> {
+        BoxOAuth::from_options(BoxOAuthOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let box_oauth = BoxOAuth::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let box_oauth = make_box_oauth(&mock);
         assert_eq!(box_oauth.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(box_oauth.token_endpoint, TOKEN_ENDPOINT);
         assert_eq!(box_oauth.revocation_endpoint, REVOCATION_ENDPOINT);
@@ -401,13 +374,15 @@ mod tests {
 
     #[test]
     fn name_returns_box() {
-        let box_oauth = BoxOAuth::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let box_oauth = make_box_oauth(&mock);
         assert_eq!(box_oauth.name(), "Box");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let box_oauth = BoxOAuth::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let box_oauth = make_box_oauth(&mock);
         let url = box_oauth.authorization_url("state123", &["root_readwrite"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -421,14 +396,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_body_credentials() {
-        let box_oauth = BoxOAuth::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -438,16 +405,17 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let box_oauth = make_box_oauth(&mock);
 
         let tokens = box_oauth
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "box-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
         assert!(get_header(&requests[0], "Authorization").is_none());
 
         let body = parse_form_body(&requests[0]);
@@ -460,14 +428,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_sends_body_credentials() {
-        let box_oauth = BoxOAuth::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -476,11 +436,9 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let box_oauth = make_box_oauth(&mock);
 
-        let tokens = box_oauth
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = box_oauth.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 
@@ -495,24 +453,17 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_token_sends_body_credentials() {
-        let box_oauth = BoxOAuth::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let box_oauth = make_box_oauth(&mock);
 
-        let result = box_oauth.revoke_token(&mock, "tok-to-revoke").await;
+        let result = box_oauth.revoke_token("tok-to-revoke").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/revoke");
+        assert_eq!(requests[0].url, REVOCATION_ENDPOINT);
         assert!(get_header(&requests[0], "Authorization").is_none());
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("token".into(), "tok-to-revoke".into())));
@@ -522,20 +473,13 @@ mod tests {
 
     #[tokio::test]
     async fn revoke_token_non_200_returns_error() {
-        let box_oauth = BoxOAuth::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 503,
             body: vec![],
         }]);
+        let box_oauth = make_box_oauth(&mock);
 
-        let result = box_oauth.revoke_token(&mock, "tok").await;
+        let result = box_oauth.revoke_token("tok").await;
         assert!(matches!(
             result,
             Err(Error::UnexpectedResponse { status: 503 })

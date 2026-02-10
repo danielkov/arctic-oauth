@@ -6,6 +6,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://oauth.yandex.com/authorize";
 const TOKEN_ENDPOINT: &str = "https://oauth.yandex.com/token";
 
+/// Configuration for creating a [`Yandex`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Yandex::new`] which uses the built-in default client.
+pub struct YandexOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Yandex](https://yandex.ru/dev/id/doc/en/concepts/ya-oauth-intro).
 ///
 /// Yandex does not require PKCE for OAuth 2.0 authorization. This client supports the
@@ -32,7 +44,7 @@ const TOKEN_ENDPOINT: &str = "https://oauth.yandex.com/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Yandex, ReqwestClient, generate_state};
+/// use arctic_oauth::{Yandex, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let yandex = Yandex::new(
@@ -47,27 +59,50 @@ const TOKEN_ENDPOINT: &str = "https://oauth.yandex.com/token";
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = yandex
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = yandex
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Yandex {
+pub struct Yandex<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Yandex {
+impl<'a, H: HttpClient> Yandex<'a, H> {
+    /// Creates a Yandex client from a [`YandexOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Yandex::new`] instead.
+    pub fn from_options(options: YandexOptions<'a, H>) -> Self {
+        Self {
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                Some(options.redirect_uri),
+            ),
+            http_client: options.http_client,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Yandex<'static, reqwest::Client> {
     /// Creates a new Yandex OAuth 2.0 client configured with production endpoints.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Yandex::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -92,62 +127,16 @@ impl Yandex {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+        Self::from_options(YandexOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Yandex {
-    /// Creates a Yandex client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Yandex;
-    ///
-    /// let yandex = Yandex::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Yandex {
+impl<'a, H: HttpClient> Yandex<'a, H> {
     /// Returns the provider name (`"Yandex"`).
     pub fn name(&self) -> &'static str {
         "Yandex"
@@ -187,8 +176,6 @@ impl Yandex {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -199,26 +186,21 @@ impl Yandex {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Yandex, ReqwestClient};
+    /// # use arctic_oauth::Yandex;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let yandex = Yandex::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = yandex
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, None)
+            .validate_authorization_code(self.http_client, &self.token_endpoint, code, None)
             .await
     }
 
@@ -230,7 +212,6 @@ impl Yandex {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -241,26 +222,21 @@ impl Yandex {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Yandex, ReqwestClient};
+    /// # use arctic_oauth::Yandex;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let yandex = Yandex::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = yandex
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 }
@@ -306,35 +282,34 @@ mod tests {
             .collect()
     }
 
+    fn make_yandex(http_client: &MockHttpClient) -> Yandex<'_, MockHttpClient> {
+        Yandex::from_options(YandexOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let yandex = Yandex::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let yandex = make_yandex(&mock);
         assert_eq!(yandex.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(yandex.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
-    fn with_endpoints_overrides_urls() {
-        let yandex = Yandex::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
-        assert_eq!(yandex.authorization_endpoint, "https://mock/authorize");
-        assert_eq!(yandex.token_endpoint, "https://mock/token");
-    }
-
-    #[test]
     fn name_returns_correct_name() {
-        let yandex = Yandex::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let yandex = make_yandex(&mock);
         assert_eq!(yandex.name(), "Yandex");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let yandex = Yandex::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let yandex = make_yandex(&mock);
         let url = yandex.authorization_url("state123", &["login:email"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -348,13 +323,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let yandex = Yandex::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -364,9 +332,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let yandex = make_yandex(&mock);
 
         let tokens = yandex
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
@@ -374,7 +343,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, "https://oauth.yandex.com/token");
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "authorization_code".into())));
@@ -384,13 +353,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let yandex = Yandex::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -399,17 +361,15 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let yandex = make_yandex(&mock);
 
-        let tokens = yandex
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = yandex.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, "https://oauth.yandex.com/token");
 
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("grant_type".into(), "refresh_token".into())));

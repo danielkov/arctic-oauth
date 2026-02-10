@@ -6,6 +6,36 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://www.facebook.com/v16.0/dialog/oauth";
 const TOKEN_ENDPOINT: &str = "https://graph.facebook.com/v16.0/oauth/access_token";
 
+/// Configuration for creating a [`Facebook`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Facebook::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Facebook, FacebookOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let facebook = Facebook::from_options(FacebookOptions {
+///     client_id: "your-client-id".into(),
+///     client_secret: "your-client-secret".into(),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct FacebookOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Facebook](https://developers.facebook.com/docs/facebook-login).
 ///
 /// Facebook does not require PKCE for authorization requests. This client supports the
@@ -35,7 +65,7 @@ const TOKEN_ENDPOINT: &str = "https://graph.facebook.com/v16.0/oauth/access_toke
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Facebook, ReqwestClient, generate_state};
+/// use arctic_oauth::{Facebook, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let facebook = Facebook::new(
@@ -50,24 +80,59 @@ const TOKEN_ENDPOINT: &str = "https://graph.facebook.com/v16.0/oauth/access_toke
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = facebook
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 /// # Ok(())
 /// # }
 /// ```
-pub struct Facebook {
+pub struct Facebook<'a, H: HttpClient> {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Facebook {
-    /// Creates a new Facebook OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Facebook<'a, H> {
+    /// Creates a Facebook client from a [`FacebookOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Facebook::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Facebook, FacebookOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let facebook = Facebook::from_options(FacebookOptions {
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: "your-client-secret".into(),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: FacebookOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            redirect_uri: options.redirect_uri,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Facebook<'static, reqwest::Client> {
+    /// Creates a new Facebook OAuth 2.0 client configured with production endpoints using the default HTTP client.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Facebook::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -92,58 +157,16 @@ impl Facebook {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::from_options(FacebookOptions {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             redirect_uri: redirect_uri.into(),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Facebook {
-    /// Creates a Facebook client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Facebook;
-    ///
-    /// let facebook = Facebook::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client_id: client_id.into(),
-            client_secret: client_secret.into(),
-            redirect_uri: redirect_uri.into(),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Facebook {
+impl<'a, H: HttpClient> Facebook<'a, H> {
     /// Returns the provider name (`"Facebook"`).
     pub fn name(&self) -> &'static str {
         "Facebook"
@@ -196,8 +219,6 @@ impl Facebook {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -208,24 +229,19 @@ impl Facebook {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Facebook, ReqwestClient};
+    /// # use arctic_oauth::Facebook;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let facebook = Facebook::new("client-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = facebook
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         let body = vec![
             ("grant_type".to_string(), "authorization_code".to_string()),
             ("code".to_string(), code.to_string()),
@@ -234,7 +250,7 @@ impl Facebook {
             ("client_secret".to_string(), self.client_secret.clone()),
         ];
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 }
 
@@ -287,22 +303,34 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_facebook(http_client: &MockHttpClient) -> Facebook<'_, MockHttpClient> {
+        Facebook::from_options(FacebookOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let fb = Facebook::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let fb = make_facebook(&mock);
         assert_eq!(fb.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(fb.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
     fn name_returns_facebook() {
-        let fb = Facebook::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let fb = make_facebook(&mock);
         assert_eq!(fb.name(), "Facebook");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let fb = Facebook::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let fb = make_facebook(&mock);
         let url = fb.authorization_url("state123", &["email", "public_profile"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -316,7 +344,8 @@ mod tests {
 
     #[test]
     fn authorization_url_without_scopes() {
-        let fb = Facebook::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let fb = make_facebook(&mock);
         let url = fb.authorization_url("state123", &[]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -325,13 +354,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_body_credentials() {
-        let fb = Facebook::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -341,16 +363,17 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let fb = make_facebook(&mock);
 
-        let tokens = fb
-            .validate_authorization_code(&mock, "auth-code")
-            .await
-            .unwrap();
+        let tokens = fb.validate_authorization_code("auth-code").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "fb-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(
+            requests[0].url,
+            "https://graph.facebook.com/v16.0/oauth/access_token"
+        );
         assert!(get_header(&requests[0], "Authorization").is_none());
 
         let body = parse_form_body(&requests[0]);

@@ -6,6 +6,36 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://slack.com/openid/connect/authorize";
 const TOKEN_ENDPOINT: &str = "https://slack.com/api/openid.connect.token";
 
+/// Configuration for creating a [`Slack`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Slack::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Slack, SlackOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let slack = Slack::from_options(SlackOptions {
+///     client_id: "your-client-id".into(),
+///     client_secret: "your-client-secret".into(),
+///     redirect_uri: Some("https://example.com/callback".into()),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct SlackOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: Option<String>,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Slack](https://api.slack.com/authentication/oauth-v2).
 ///
 /// Slack's OAuth implementation follows the standard authorization code flow without
@@ -33,7 +63,7 @@ const TOKEN_ENDPOINT: &str = "https://slack.com/api/openid.connect.token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Slack, ReqwestClient, generate_state};
+/// use arctic_oauth::{Slack, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let slack = Slack::new(
@@ -48,22 +78,59 @@ const TOKEN_ENDPOINT: &str = "https://slack.com/api/openid.connect.token";
 /// // Store `state` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = slack
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 /// # Ok(())
 /// # }
 /// ```
-pub struct Slack {
+pub struct Slack<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Slack {
-    /// Creates a new Slack OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Slack<'a, H> {
+    /// Creates a Slack client from a [`SlackOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Slack::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Slack, SlackOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let slack = Slack::from_options(SlackOptions {
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: "your-client-secret".into(),
+    ///     redirect_uri: Some("https://example.com/callback".into()),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: SlackOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                options.redirect_uri,
+            ),
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Slack<'static, reqwest::Client> {
+    /// Creates a new Slack OAuth 2.0 client configured with production endpoints using the default HTTP client.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Slack::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -88,54 +155,16 @@ impl Slack {
         client_secret: impl Into<String>,
         redirect_uri: Option<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, Some(client_secret.into()), redirect_uri),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+        Self::from_options(SlackOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri,
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Slack {
-    /// Creates a Slack client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Slack;
-    ///
-    /// let slack = Slack::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     Some("http://localhost/callback".into()),
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: Option<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, Some(client_secret.into()), redirect_uri),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Slack {
+impl<'a, H: HttpClient> Slack<'a, H> {
     /// Returns the provider name (`"Slack"`).
     pub fn name(&self) -> &'static str {
         "Slack"
@@ -175,8 +204,6 @@ impl Slack {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -187,26 +214,21 @@ impl Slack {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Slack, ReqwestClient};
+    /// # use arctic_oauth::Slack;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let slack = Slack::new("client-id", "secret", Some("https://example.com/cb".into()));
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = slack
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, None)
+            .validate_authorization_code(self.http_client, &self.token_endpoint, code, None)
             .await
     }
 }
@@ -254,28 +276,46 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_slack(http_client: &MockHttpClient) -> Slack<'_, MockHttpClient> {
+        Slack::from_options(SlackOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: Some("https://app/cb".into()),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let slack = Slack::new("cid", "secret", Some("https://app/cb".into()));
+        let mock = MockHttpClient::new(vec![]);
+        let slack = make_slack(&mock);
         assert_eq!(slack.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(slack.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
     fn name_returns_slack() {
-        let slack = Slack::new("cid", "secret", Some("https://app/cb".into()));
+        let mock = MockHttpClient::new(vec![]);
+        let slack = make_slack(&mock);
         assert_eq!(slack.name(), "Slack");
     }
 
     #[test]
     fn new_with_no_redirect_uri() {
-        let slack = Slack::new("cid", "secret", None);
+        let mock = MockHttpClient::new(vec![]);
+        let slack = Slack::from_options(SlackOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: None,
+            http_client: &mock,
+        });
         assert_eq!(slack.name(), "Slack");
     }
 
     #[test]
     fn authorization_url_with_scopes() {
-        let slack = Slack::new("cid", "secret", Some("https://app/cb".into()));
+        let mock = MockHttpClient::new(vec![]);
+        let slack = make_slack(&mock);
         let url = slack.authorization_url("state123", &["openid", "profile", "email"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -288,7 +328,13 @@ mod tests {
 
     #[test]
     fn authorization_url_omits_redirect_uri_when_none() {
-        let slack = Slack::new("cid", "secret", None);
+        let mock = MockHttpClient::new(vec![]);
+        let slack = Slack::from_options(SlackOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: None,
+            http_client: &mock,
+        });
         let url = slack.authorization_url("state123", &["openid"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -297,13 +343,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let slack = Slack::with_endpoints(
-            "cid",
-            "secret",
-            Some("https://app/cb".into()),
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -312,16 +351,20 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let slack = make_slack(&mock);
 
         let tokens = slack
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "slack-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(
+            requests[0].url,
+            "https://slack.com/api/openid.connect.token"
+        );
         assert!(get_header(&requests[0], "Authorization").is_some());
     }
 }

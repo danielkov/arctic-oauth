@@ -8,6 +8,18 @@ const AUTHORIZATION_ENDPOINT: &str = "https://apis.roblox.com/oauth/v1/authorize
 const TOKEN_ENDPOINT: &str = "https://apis.roblox.com/oauth/v1/token";
 const REVOCATION_ENDPOINT: &str = "https://apis.roblox.com/oauth/v1/token/revoke";
 
+/// Configuration for creating a [`Roblox`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Roblox::new`] which uses the built-in default client.
+pub struct RobloxOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Roblox](https://create.roblox.com/docs/cloud/reference/oauth2).
 ///
 /// Roblox requires PKCE (Proof Key for Code Exchange) with the S256 challenge method
@@ -37,7 +49,7 @@ const REVOCATION_ENDPOINT: &str = "https://apis.roblox.com/oauth/v1/token/revoke
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Roblox, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Roblox, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let provider = Roblox::new(
@@ -52,31 +64,56 @@ const REVOCATION_ENDPOINT: &str = "https://apis.roblox.com/oauth/v1/token/revoke
 /// let url = provider.authorization_url(&state, &["openid", "profile"], &code_verifier);
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = provider
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = provider
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// provider.revoke_token(&http, tokens.access_token()?).await?;
+/// provider.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Roblox {
+pub struct Roblox<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl Roblox {
-    /// Creates a new Roblox OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Roblox<'a, H> {
+    /// Creates a Roblox client from a [`RobloxOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Roblox::new`] instead.
+    pub fn from_options(options: RobloxOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                options.client_secret,
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Roblox<'static, reqwest::Client> {
+    /// Creates a new Roblox OAuth 2.0 client using the default HTTP client.
+    ///
+    /// The endpoints are automatically set to production values.
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Roblox::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -101,60 +138,16 @@ impl Roblox {
         client_secret: Option<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, client_secret, Some(redirect_uri.into())),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
-        }
+        Self::from_options(RobloxOptions {
+            client_id: client_id.into(),
+            client_secret,
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Roblox {
-    /// Creates a Roblox client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Roblox;
-    ///
-    /// let provider = Roblox::with_endpoints(
-    ///     "test-client-id",
-    ///     Some("test-secret".to_string()),
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    ///     Some("http://localhost:8080/revoke"),
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: Option<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-        revocation_endpoint: Option<&str>,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(client_id, client_secret, Some(redirect_uri.into())),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-            revocation_endpoint: revocation_endpoint
-                .unwrap_or(REVOCATION_ENDPOINT)
-                .to_string(),
-        }
-    }
-}
-
-impl Roblox {
+impl<'a, H: HttpClient> Roblox<'a, H> {
     /// Returns the provider name (`"Roblox"`).
     pub fn name(&self) -> &'static str {
         "Roblox"
@@ -172,24 +165,7 @@ impl Roblox {
     /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["openid", "profile"]`).
     /// * `code_verifier` - The PKCE code verifier. Use
     ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// use arctic_oauth::{Roblox, generate_state, generate_code_verifier};
-    ///
-    /// let provider = Roblox::new("client-id", Some("secret".to_string()), "https://example.com/cb");
-    /// let state = generate_state();
-    /// let verifier = generate_code_verifier();
-    ///
-    /// let url = provider.authorization_url(&state, &["openid", "profile"], &verifier);
-    /// ```
-    pub fn authorization_url(
-        &self,
-        state: &str,
-        scopes: &[&str],
-        code_verifier: &str,
-    ) -> url::Url {
+    pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
         self.client.create_authorization_url_with_pkce(
             &self.authorization_endpoint,
             state,
@@ -207,8 +183,6 @@ impl Roblox {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier used when creating the authorization URL.
     ///
@@ -216,32 +190,14 @@ impl Roblox {
     ///
     /// Returns [`Error::OAuthRequest`] if Roblox rejects the code, or
     /// [`Error::Http`] on network failure.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use arctic_oauth::{Roblox, ReqwestClient};
-    /// # async fn example() -> Result<(), arctic_oauth::Error> {
-    /// let provider = Roblox::new("client-id", Some("secret".to_string()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
-    ///
-    /// let tokens = provider
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-verifier")
-    ///     .await?;
-    ///
-    /// println!("Access token: {}", tokens.access_token()?);
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
             .validate_authorization_code(
-                http_client,
+                self.http_client,
                 &self.token_endpoint,
                 code,
                 Some(code_verifier),
@@ -256,37 +212,15 @@ impl Roblox {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
     ///
     /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
     /// [`Error::Http`] on network failure.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use arctic_oauth::{Roblox, ReqwestClient};
-    /// # async fn example() -> Result<(), arctic_oauth::Error> {
-    /// let provider = Roblox::new("client-id", Some("secret".to_string()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
-    ///
-    /// let new_tokens = provider
-    ///     .refresh_access_token(&http, "stored-refresh-token")
-    ///     .await?;
-    ///
-    /// println!("New access token: {}", new_tokens.access_token()?);
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 
@@ -297,33 +231,15 @@ impl Roblox {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token or refresh token to revoke.
     ///
     /// # Errors
     ///
     /// Returns [`Error::UnexpectedResponse`] if Roblox returns a non-200 status, or
     /// [`Error::Http`] on network failure.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # use arctic_oauth::{Roblox, ReqwestClient};
-    /// # async fn example() -> Result<(), arctic_oauth::Error> {
-    /// let provider = Roblox::new("client-id", Some("secret".to_string()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
-    ///
-    /// provider.revoke_token(&http, "token-to-revoke").await?;
-    /// # Ok(())
-    /// # }
-    /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         self.client
-            .revoke_token(http_client, &self.revocation_endpoint, token)
+            .revoke_token(self.http_client, &self.revocation_endpoint, token)
             .await
     }
 }
@@ -369,9 +285,19 @@ mod tests {
             .collect()
     }
 
+    fn make_roblox(http_client: &MockHttpClient) -> Roblox<'_, MockHttpClient> {
+        Roblox::from_options(RobloxOptions {
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let roblox = Roblox::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let roblox = make_roblox(&mock);
         assert_eq!(roblox.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(roblox.token_endpoint, TOKEN_ENDPOINT);
         assert_eq!(roblox.revocation_endpoint, REVOCATION_ENDPOINT);
@@ -379,13 +305,15 @@ mod tests {
 
     #[test]
     fn name_returns_roblox() {
-        let roblox = Roblox::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let roblox = make_roblox(&mock);
         assert_eq!(roblox.name(), "Roblox");
     }
 
     #[test]
     fn authorization_url_includes_pkce() {
-        let roblox = Roblox::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let roblox = make_roblox(&mock);
         let url = roblox.authorization_url("state123", &["openid", "profile"], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -399,14 +327,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let roblox = Roblox::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -416,30 +336,23 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let roblox = make_roblox(&mock);
 
         let tokens = roblox
-            .validate_authorization_code(&mock, "auth-code", "verifier")
+            .validate_authorization_code("auth-code", "verifier")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "roblox-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, TOKEN_ENDPOINT);
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("code_verifier".into(), "verifier".into())));
     }
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let roblox = Roblox::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -448,35 +361,26 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let roblox = make_roblox(&mock);
 
-        let tokens = roblox
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = roblox.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
     }
 
     #[tokio::test]
     async fn revoke_token_delegates_to_client() {
-        let roblox = Roblox::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let roblox = make_roblox(&mock);
 
-        let result = roblox.revoke_token(&mock, "tok-to-revoke").await;
+        let result = roblox.revoke_token("tok-to-revoke").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/revoke");
+        assert_eq!(requests[0].url, REVOCATION_ENDPOINT);
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("token".into(), "tok-to-revoke".into())));
     }

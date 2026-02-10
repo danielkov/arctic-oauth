@@ -5,8 +5,6 @@ pub mod github;
 #[cfg(feature = "google")]
 pub mod google;
 
-#[cfg(feature = "forty-two")]
-pub mod forty_two;
 #[cfg(feature = "amazon-cognito")]
 pub mod amazon_cognito;
 #[cfg(feature = "anilist")]
@@ -45,6 +43,8 @@ pub mod etsy;
 pub mod facebook;
 #[cfg(feature = "figma")]
 pub mod figma;
+#[cfg(feature = "forty-two")]
+pub mod forty_two;
 #[cfg(feature = "gitea")]
 pub mod gitea;
 #[cfg(feature = "gitlab")]

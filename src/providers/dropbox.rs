@@ -7,6 +7,36 @@ const AUTHORIZATION_ENDPOINT: &str = "https://www.dropbox.com/oauth2/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.dropboxapi.com/oauth2/token";
 const REVOCATION_ENDPOINT: &str = "https://api.dropboxapi.com/2/auth/token/revoke";
 
+/// Configuration for creating a [`Dropbox`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Dropbox::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Dropbox, DropboxOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let dropbox = Dropbox::from_options(DropboxOptions {
+///     client_id: "your-client-id".into(),
+///     client_secret: "your-client-secret".into(),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct DropboxOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Dropbox](https://developers.dropbox.com/oauth-guide).
 ///
 /// Dropbox uses standard OAuth 2.0 authorization code flow without PKCE.
@@ -35,7 +65,7 @@ const REVOCATION_ENDPOINT: &str = "https://api.dropboxapi.com/2/auth/token/revok
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Dropbox, ReqwestClient, generate_state};
+/// use arctic_oauth::{Dropbox, generate_state};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let provider = Dropbox::new(
@@ -49,31 +79,69 @@ const REVOCATION_ENDPOINT: &str = "https://api.dropboxapi.com/2/auth/token/revok
 /// let url = provider.authorization_url(&state, &["account_info.read", "files.content.read"]);
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = provider
-///     .validate_authorization_code(&http, "authorization-code")
+///     .validate_authorization_code("authorization-code")
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = provider
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 ///
 /// // Step 4 (optional): Revoke a token.
-/// provider.revoke_token(&http, tokens.access_token()?).await?;
+/// provider.revoke_token(tokens.access_token()?).await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Dropbox {
+pub struct Dropbox<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
     revocation_endpoint: String,
 }
 
-impl Dropbox {
-    /// Creates a new Dropbox OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Dropbox<'a, H> {
+    /// Creates a Dropbox client from a [`DropboxOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Dropbox::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Dropbox, DropboxOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let dropbox = Dropbox::from_options(DropboxOptions {
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: "your-client-secret".into(),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: DropboxOptions<'a, H>) -> Self {
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                Some(options.client_secret),
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Dropbox<'static, reqwest::Client> {
+    /// Creates a new Dropbox OAuth 2.0 client configured with production endpoints using the default HTTP client.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Dropbox::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -98,68 +166,16 @@ impl Dropbox {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-            revocation_endpoint: REVOCATION_ENDPOINT.to_string(),
-        }
+        Self::from_options(DropboxOptions {
+            client_id: client_id.into(),
+            client_secret: client_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Dropbox {
-    /// Creates a Dropbox client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Dropbox;
-    ///
-    /// let provider = Dropbox::with_endpoints(
-    ///     "test-client-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    ///     Some("http://localhost:8080/revoke"),
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-        revocation_endpoint: Option<&str>,
-    ) -> Self {
-        Self {
-            client: OAuth2Client::new(
-                client_id,
-                Some(client_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-            revocation_endpoint: revocation_endpoint
-                .unwrap_or(REVOCATION_ENDPOINT)
-                .to_string(),
-        }
-    }
-}
-
-impl Dropbox {
+impl<'a, H: HttpClient> Dropbox<'a, H> {
     /// Returns the provider name (`"Dropbox"`).
     pub fn name(&self) -> &'static str {
         "Dropbox"
@@ -198,8 +214,6 @@ impl Dropbox {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     ///
     /// # Errors
@@ -210,26 +224,21 @@ impl Dropbox {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Dropbox, ReqwestClient};
+    /// # use arctic_oauth::Dropbox;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let provider = Dropbox::new("client-id", "client-secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = provider
-    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .validate_authorization_code("the-auth-code")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn validate_authorization_code(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        code: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn validate_authorization_code(&self, code: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .validate_authorization_code(http_client, &self.token_endpoint, code, None)
+            .validate_authorization_code(self.http_client, &self.token_endpoint, code, None)
             .await
     }
 
@@ -240,7 +249,6 @@ impl Dropbox {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -251,26 +259,21 @@ impl Dropbox {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Dropbox, ReqwestClient};
+    /// # use arctic_oauth::Dropbox;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let provider = Dropbox::new("client-id", "client-secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = provider
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 
@@ -281,7 +284,6 @@ impl Dropbox {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `token` - The access token to revoke.
     ///
     /// # Errors
@@ -292,22 +294,17 @@ impl Dropbox {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Dropbox, ReqwestClient};
+    /// # use arctic_oauth::Dropbox;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let provider = Dropbox::new("client-id", "client-secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
-    /// provider.revoke_token(&http, "token-to-revoke").await?;
+    /// provider.revoke_token("token-to-revoke").await?;
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn revoke_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        token: &str,
-    ) -> Result<(), Error> {
+    pub async fn revoke_token(&self, token: &str) -> Result<(), Error> {
         self.client
-            .revoke_token(http_client, &self.revocation_endpoint, token)
+            .revoke_token(self.http_client, &self.revocation_endpoint, token)
             .await
     }
 }
@@ -361,9 +358,19 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_dropbox(http_client: &MockHttpClient) -> Dropbox<'_, MockHttpClient> {
+        Dropbox::from_options(DropboxOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let dropbox = Dropbox::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let dropbox = make_dropbox(&mock);
         assert_eq!(dropbox.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(dropbox.token_endpoint, TOKEN_ENDPOINT);
         assert_eq!(dropbox.revocation_endpoint, REVOCATION_ENDPOINT);
@@ -371,13 +378,15 @@ mod tests {
 
     #[test]
     fn name_returns_dropbox() {
-        let dropbox = Dropbox::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let dropbox = make_dropbox(&mock);
         assert_eq!(dropbox.name(), "Dropbox");
     }
 
     #[test]
     fn authorization_url_builds_correct_params() {
-        let dropbox = Dropbox::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let dropbox = make_dropbox(&mock);
         let url = dropbox.authorization_url("state123", &["files.content.read"]);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -391,14 +400,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
-        let dropbox = Dropbox::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -408,29 +409,22 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let dropbox = make_dropbox(&mock);
 
         let tokens = dropbox
-            .validate_authorization_code(&mock, "auth-code")
+            .validate_authorization_code("auth-code")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "dropbox-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, "https://api.dropboxapi.com/oauth2/token");
         assert!(get_header(&requests[0], "Authorization").is_some());
     }
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let dropbox = Dropbox::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            None,
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -439,35 +433,29 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let dropbox = make_dropbox(&mock);
 
-        let tokens = dropbox
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = dropbox.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
     }
 
     #[tokio::test]
     async fn revoke_token_delegates_to_client() {
-        let dropbox = Dropbox::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-            Some("https://mock/revoke"),
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: vec![],
         }]);
+        let dropbox = make_dropbox(&mock);
 
-        let result = dropbox.revoke_token(&mock, "tok-to-revoke").await;
+        let result = dropbox.revoke_token("tok-to-revoke").await;
         assert!(result.is_ok());
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/revoke");
+        assert_eq!(
+            requests[0].url,
+            "https://api.dropboxapi.com/2/auth/token/revoke"
+        );
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("token".into(), "tok-to-revoke".into())));
     }

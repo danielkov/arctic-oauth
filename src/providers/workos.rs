@@ -7,6 +7,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://api.workos.com/sso/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.workos.com/sso/token";
 
+/// Configuration for creating a [`WorkOS`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`WorkOS::new`] which uses the built-in default client.
+pub struct WorkOSOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [WorkOS](https://workos.com/docs/reference/sso).
 ///
 /// WorkOS supports optional PKCE with the S256 challenge method. The client secret is
@@ -32,7 +44,7 @@ const TOKEN_ENDPOINT: &str = "https://api.workos.com/sso/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{WorkOS, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{WorkOS, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// // Public client with PKCE
@@ -49,24 +61,42 @@ const TOKEN_ENDPOINT: &str = "https://api.workos.com/sso/token";
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = workos
-///     .validate_authorization_code(&http, "authorization-code", Some(&code_verifier))
+///     .validate_authorization_code("authorization-code", Some(&code_verifier))
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 /// # Ok(())
 /// # }
 /// ```
-pub struct WorkOS {
+pub struct WorkOS<'a, H: HttpClient> {
     client_id: String,
     client_secret: Option<String>,
     redirect_uri: String,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl WorkOS {
-    /// Creates a new WorkOS OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> WorkOS<'a, H> {
+    /// Creates a WorkOS client from a [`WorkOSOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`WorkOS::new`] instead.
+    pub fn from_options(options: WorkOSOptions<'a, H>) -> Self {
+        Self {
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            redirect_uri: options.redirect_uri,
+            http_client: options.http_client,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl WorkOS<'static, reqwest::Client> {
+    /// Creates a new WorkOS OAuth 2.0 client using the default HTTP client.
     ///
     /// # Arguments
     ///
@@ -100,58 +130,16 @@ impl WorkOS {
         client_secret: Option<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::from_options(WorkOSOptions {
             client_id: client_id.into(),
             client_secret,
             redirect_uri: redirect_uri.into(),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl WorkOS {
-    /// Creates a WorkOS client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::WorkOS;
-    ///
-    /// let workos = WorkOS::with_endpoints(
-    ///     "test-client-id",
-    ///     Some("test-secret".to_string()),
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: Option<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client_id: client_id.into(),
-            client_secret,
-            redirect_uri: redirect_uri.into(),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl WorkOS {
+impl<'a, H: HttpClient> WorkOS<'a, H> {
     /// Returns the provider name (`"WorkOS"`).
     pub fn name(&self) -> &'static str {
         "WorkOS"
@@ -184,11 +172,7 @@ impl WorkOS {
     /// let url = workos.authorization_url(&state, Some(&verifier));
     /// assert!(url.as_str().starts_with("https://api.workos.com/"));
     /// ```
-    pub fn authorization_url(
-        &self,
-        state: &str,
-        code_verifier: Option<&str>,
-    ) -> url::Url {
+    pub fn authorization_url(&self, state: &str, code_verifier: Option<&str>) -> url::Url {
         let mut url =
             url::Url::parse(&self.authorization_endpoint).expect("invalid authorization endpoint");
         {
@@ -214,8 +198,6 @@ impl WorkOS {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier if it was used during authorization.
     ///
@@ -227,13 +209,12 @@ impl WorkOS {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{WorkOS, ReqwestClient};
+    /// # use arctic_oauth::WorkOS;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let workos = WorkOS::new("client-id", None, "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = workos
-    ///     .validate_authorization_code(&http, "the-auth-code", Some("the-code-verifier"))
+    ///     .validate_authorization_code("the-auth-code", Some("the-code-verifier"))
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -242,7 +223,6 @@ impl WorkOS {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: Option<&str>,
     ) -> Result<OAuth2Tokens, Error> {
@@ -259,7 +239,7 @@ impl WorkOS {
             body.push(("code_verifier".to_string(), verifier.to_string()));
         }
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 }
 
@@ -312,22 +292,43 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_workos_confidential(http_client: &MockHttpClient) -> WorkOS<'_, MockHttpClient> {
+        WorkOS::from_options(WorkOSOptions {
+            client_id: "cid".into(),
+            client_secret: Some("secret".into()),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
+    fn make_workos_public(http_client: &MockHttpClient) -> WorkOS<'_, MockHttpClient> {
+        WorkOS::from_options(WorkOSOptions {
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let workos = WorkOS::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let workos = make_workos_confidential(&mock);
         assert_eq!(workos.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(workos.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
     fn name_returns_workos() {
-        let workos = WorkOS::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let workos = make_workos_confidential(&mock);
         assert_eq!(workos.name(), "WorkOS");
     }
 
     #[test]
     fn authorization_url_without_pkce() {
-        let workos = WorkOS::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let workos = make_workos_confidential(&mock);
         let url = workos.authorization_url("state123", None);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -342,7 +343,8 @@ mod tests {
 
     #[test]
     fn authorization_url_with_pkce() {
-        let workos = WorkOS::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let workos = make_workos_confidential(&mock);
         let url = workos.authorization_url("state123", Some("my-verifier"));
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -354,7 +356,8 @@ mod tests {
 
     #[test]
     fn authorization_url_no_scopes() {
-        let workos = WorkOS::new("cid", Some("secret".into()), "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let workos = make_workos_confidential(&mock);
         let url = workos.authorization_url("state123", None);
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -363,13 +366,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_with_secret() {
-        let workos = WorkOS::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -378,9 +374,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let workos = make_workos_confidential(&mock);
 
         let tokens = workos
-            .validate_authorization_code(&mock, "auth-code", None)
+            .validate_authorization_code("auth-code", None)
             .await
             .unwrap();
 
@@ -388,7 +385,7 @@ mod tests {
 
         let requests = mock.take_requests();
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, "https://api.workos.com/sso/token");
         assert!(get_header(&requests[0], "Authorization").is_none());
 
         let body = parse_form_body(&requests[0]);
@@ -402,13 +399,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_public_client() {
-        let workos = WorkOS::with_endpoints(
-            "cid",
-            None,
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -417,9 +407,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let workos = make_workos_public(&mock);
 
         workos
-            .validate_authorization_code(&mock, "auth-code", Some("my-verifier"))
+            .validate_authorization_code("auth-code", Some("my-verifier"))
             .await
             .unwrap();
 
@@ -432,13 +423,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_with_pkce() {
-        let workos = WorkOS::with_endpoints(
-            "cid",
-            Some("secret".into()),
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -447,9 +431,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let workos = make_workos_confidential(&mock);
 
         workos
-            .validate_authorization_code(&mock, "auth-code", Some("my-verifier"))
+            .validate_authorization_code("auth-code", Some("my-verifier"))
             .await
             .unwrap();
 

@@ -84,9 +84,8 @@ all-providers = [
     "shikimori", "slack", "spotify", "start-gg", "strava",
     "synology", "tiktok", "tiltify", "tumblr", "twitch",
     "twitter", "vk", "withings", "workos", "yahoo",
-    "yandex", "zoom", "testing",
+    "yandex", "zoom",
 ]
-testing = []
 
 [dependencies]
 url = "2"
@@ -102,4 +101,3 @@ ecdsa = { version = "0.16", features = ["signing"], optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
-wiremock = "0.6"

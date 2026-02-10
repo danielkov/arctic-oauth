@@ -7,6 +7,18 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://access.line.me/oauth2/v2.1/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.line.me/oauth2/v2.1/token";
 
+/// Configuration for creating a [`Line`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Line::new`] which uses the built-in default client.
+pub struct LineOptions<'a, H: HttpClient> {
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [LINE](https://developers.line.biz/en/docs/line-login/integrate-line-login/).
 ///
 /// LINE requires PKCE with the S256 challenge method on all authorization requests.
@@ -33,7 +45,7 @@ const TOKEN_ENDPOINT: &str = "https://api.line.me/oauth2/v2.1/token";
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Line, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Line, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let line = Line::new(
@@ -48,29 +60,47 @@ const TOKEN_ENDPOINT: &str = "https://api.line.me/oauth2/v2.1/token";
 /// let url = line.authorization_url(&state, &["profile", "openid"], &code_verifier);
 ///
 /// // Step 2: Exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = line
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = line
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Line {
+pub struct Line<'a, H: HttpClient> {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Line {
-    /// Creates a new LINE OAuth 2.0 client configured with production endpoints.
+impl<'a, H: HttpClient> Line<'a, H> {
+    /// Creates a Line client from a [`LineOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Line::new`] instead.
+    pub fn from_options(options: LineOptions<'a, H>) -> Self {
+        Self {
+            client_id: options.client_id,
+            client_secret: options.client_secret,
+            redirect_uri: options.redirect_uri,
+            http_client: options.http_client,
+            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
+            token_endpoint: TOKEN_ENDPOINT.to_string(),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Line<'static, reqwest::Client> {
+    /// Creates a new LINE OAuth 2.0 client using the default HTTP client.
     ///
     /// # Arguments
     ///
@@ -95,58 +125,16 @@ impl Line {
         client_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        Self {
+        Self::from_options(LineOptions {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             redirect_uri: redirect_uri.into(),
-            authorization_endpoint: AUTHORIZATION_ENDPOINT.to_string(),
-            token_endpoint: TOKEN_ENDPOINT.to_string(),
-        }
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
-impl Line {
-    /// Creates a LINE client with custom endpoint URLs.
-    ///
-    /// This is useful for integration testing with mock servers (e.g.
-    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
-    /// is enabled or in `#[cfg(test)]` builds.
-    ///
-    /// # Example
-    ///
-    /// ```rust
-    /// # #[cfg(feature = "testing")]
-    /// # {
-    /// use arctic_oauth::Line;
-    ///
-    /// let line = Line::with_endpoints(
-    ///     "test-channel-id",
-    ///     "test-secret",
-    ///     "http://localhost/callback",
-    ///     "http://localhost:8080/authorize",
-    ///     "http://localhost:8080/token",
-    /// );
-    /// # }
-    /// ```
-    pub fn with_endpoints(
-        client_id: impl Into<String>,
-        client_secret: impl Into<String>,
-        redirect_uri: impl Into<String>,
-        authorization_endpoint: &str,
-        token_endpoint: &str,
-    ) -> Self {
-        Self {
-            client_id: client_id.into(),
-            client_secret: client_secret.into(),
-            redirect_uri: redirect_uri.into(),
-            authorization_endpoint: authorization_endpoint.to_string(),
-            token_endpoint: token_endpoint.to_string(),
-        }
-    }
-}
-
-impl Line {
+impl<'a, H: HttpClient> Line<'a, H> {
     /// Returns the provider name (`"Line"`).
     pub fn name(&self) -> &'static str {
         "Line"
@@ -205,8 +193,6 @@ impl Line {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -218,13 +204,12 @@ impl Line {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Line, ReqwestClient};
+    /// # use arctic_oauth::Line;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let line = Line::new("channel-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = line
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -233,7 +218,6 @@ impl Line {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
@@ -246,7 +230,7 @@ impl Line {
             ("code_verifier".to_string(), code_verifier.to_string()),
         ];
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 
     /// Refreshes an expired access token using a refresh token.
@@ -257,7 +241,6 @@ impl Line {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -268,24 +251,19 @@ impl Line {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Line, ReqwestClient};
+    /// # use arctic_oauth::Line;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let line = Line::new("channel-id", "secret", "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = line
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         let body = vec![
             ("grant_type".to_string(), "refresh_token".to_string()),
             ("refresh_token".to_string(), refresh_token.to_string()),
@@ -293,7 +271,7 @@ impl Line {
             ("client_secret".to_string(), self.client_secret.clone()),
         ];
         let request = create_oauth2_request(&self.token_endpoint, &body);
-        send_token_request(http_client, request).await
+        send_token_request(self.http_client, request).await
     }
 }
 
@@ -346,22 +324,34 @@ mod tests {
             .map(|(_, v)| v.as_str())
     }
 
+    fn make_line(http_client: &MockHttpClient) -> Line<'_, MockHttpClient> {
+        Line::from_options(LineOptions {
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_sets_production_endpoints() {
-        let line = Line::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let line = make_line(&mock);
         assert_eq!(line.authorization_endpoint, AUTHORIZATION_ENDPOINT);
         assert_eq!(line.token_endpoint, TOKEN_ENDPOINT);
     }
 
     #[test]
     fn name_returns_line() {
-        let line = Line::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let line = make_line(&mock);
         assert_eq!(line.name(), "Line");
     }
 
     #[test]
     fn authorization_url_includes_pkce_params() {
-        let line = Line::new("cid", "secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let line = make_line(&mock);
         let url = line.authorization_url("state123", &["profile", "openid"], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -376,13 +366,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_body_credentials_with_pkce() {
-        let line = Line::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -392,16 +375,17 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let line = make_line(&mock);
 
         let tokens = line
-            .validate_authorization_code(&mock, "auth-code", "my-verifier")
+            .validate_authorization_code("auth-code", "my-verifier")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "line-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/token");
+        assert_eq!(requests[0].url, "https://api.line.me/oauth2/v2.1/token");
         assert!(get_header(&requests[0], "Authorization").is_none());
 
         let body = parse_form_body(&requests[0]);
@@ -415,13 +399,6 @@ mod tests {
 
     #[tokio::test]
     async fn refresh_access_token_sends_body_credentials() {
-        let line = Line::with_endpoints(
-            "cid",
-            "secret",
-            "https://app/cb",
-            "https://mock/authorize",
-            "https://mock/token",
-        );
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -430,11 +407,9 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let line = make_line(&mock);
 
-        let tokens = line
-            .refresh_access_token(&mock, "refresh-tok")
-            .await
-            .unwrap();
+        let tokens = line.refresh_access_token("refresh-tok").await.unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
 

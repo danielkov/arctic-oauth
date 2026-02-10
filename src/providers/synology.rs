@@ -4,6 +4,38 @@ use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
 use crate::tokens::OAuth2Tokens;
 
+/// Configuration for creating a [`Synology`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Synology::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Synology, SynologyOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let synology = Synology::from_options(SynologyOptions {
+///     base_url: "https://nas.example.com:5001".into(),
+///     application_id: "your-application-id".into(),
+///     application_secret: "your-application-secret".into(),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct SynologyOptions<'a, H: HttpClient> {
+    pub base_url: String,
+    pub application_id: String,
+    pub application_secret: String,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Synology](https://kb.synology.com/en-global/DSM/help/OAuthService/oauth_service_desc?version=7).
 ///
 /// Synology requires PKCE with the S256 challenge method. This client supports
@@ -30,7 +62,7 @@ use crate::tokens::OAuth2Tokens;
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Synology, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Synology, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let synology = Synology::new(
@@ -47,22 +79,61 @@ use crate::tokens::OAuth2Tokens;
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = synology
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 /// # Ok(())
 /// # }
 /// ```
-pub struct Synology {
+pub struct Synology<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Synology {
-    /// Creates a new Synology OAuth 2.0 client for a self-hosted NAS.
+impl<'a, H: HttpClient> Synology<'a, H> {
+    /// Creates a Synology client from a [`SynologyOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Synology::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Synology, SynologyOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let synology = Synology::from_options(SynologyOptions {
+    ///     base_url: "https://nas.example.com:5001".into(),
+    ///     application_id: "your-application-id".into(),
+    ///     application_secret: "your-application-secret".into(),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: SynologyOptions<'a, H>) -> Self {
+        let base = options.base_url;
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.application_id,
+                Some(options.application_secret),
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: format!("{base}/webman/sso/SSOOauth.cgi"),
+            token_endpoint: format!("{base}/webman/sso/SSOAccessToken.cgi"),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Synology<'static, reqwest::Client> {
+    /// Creates a new Synology OAuth 2.0 client for a self-hosted NAS using the default HTTP client.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Synology::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -90,20 +161,17 @@ impl Synology {
         application_secret: impl Into<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        let base = base_url.into();
-        Self {
-            client: OAuth2Client::new(
-                application_id,
-                Some(application_secret.into()),
-                Some(redirect_uri.into()),
-            ),
-            authorization_endpoint: format!("{base}/webman/sso/SSOOauth.cgi"),
-            token_endpoint: format!("{base}/webman/sso/SSOAccessToken.cgi"),
-        }
+        Self::from_options(SynologyOptions {
+            base_url: base_url.into(),
+            application_id: application_id.into(),
+            application_secret: application_secret.into(),
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-impl Synology {
+impl<'a, H: HttpClient> Synology<'a, H> {
     /// Returns the provider name (`"Synology"`).
     pub fn name(&self) -> &'static str {
         "Synology"
@@ -140,12 +208,7 @@ impl Synology {
     /// let url = synology.authorization_url(&state, &["user.profile"], &verifier);
     /// assert!(url.as_str().starts_with("https://nas.example.com:5001/webman/sso/"));
     /// ```
-    pub fn authorization_url(
-        &self,
-        state: &str,
-        scopes: &[&str],
-        code_verifier: &str,
-    ) -> url::Url {
+    pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
         self.client.create_authorization_url_with_pkce(
             &self.authorization_endpoint,
             state,
@@ -163,8 +226,6 @@ impl Synology {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -176,7 +237,7 @@ impl Synology {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Synology, ReqwestClient};
+    /// # use arctic_oauth::Synology;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let synology = Synology::new(
     ///     "https://nas.example.com:5001",
@@ -184,10 +245,9 @@ impl Synology {
     ///     "secret",
     ///     "https://example.com/cb"
     /// );
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = synology
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -196,13 +256,12 @@ impl Synology {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
             .validate_authorization_code(
-                http_client,
+                self.http_client,
                 &self.token_endpoint,
                 code,
                 Some(code_verifier),
@@ -252,14 +311,20 @@ mod tests {
             .collect()
     }
 
+    fn make_synology(http_client: &MockHttpClient) -> Synology<'_, MockHttpClient> {
+        Synology::from_options(SynologyOptions {
+            base_url: "https://nas.example.com:5001".into(),
+            application_id: "app-id".into(),
+            application_secret: "app-secret".into(),
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_builds_endpoints_from_base_url() {
-        let synology = Synology::new(
-            "https://nas.example.com:5001",
-            "app-id",
-            "app-secret",
-            "https://app/cb",
-        );
+        let mock = MockHttpClient::new(vec![]);
+        let synology = make_synology(&mock);
         assert_eq!(
             synology.authorization_endpoint,
             "https://nas.example.com:5001/webman/sso/SSOOauth.cgi"
@@ -272,13 +337,15 @@ mod tests {
 
     #[test]
     fn name_returns_synology() {
-        let synology = Synology::new("https://nas.local", "app-id", "app-secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let synology = make_synology(&mock);
         assert_eq!(synology.name(), "Synology");
     }
 
     #[test]
     fn authorization_url_includes_pkce() {
-        let synology = Synology::new("https://nas.local", "app-id", "app-secret", "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let synology = make_synology(&mock);
         let url = synology.authorization_url("state123", &[], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -290,7 +357,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_verifier() {
-        let synology = Synology::new("https://mock", "app-id", "app-secret", "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -299,9 +365,10 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let synology = make_synology(&mock);
 
         let tokens = synology
-            .validate_authorization_code(&mock, "code", "verifier")
+            .validate_authorization_code("code", "verifier")
             .await
             .unwrap();
 
@@ -310,7 +377,7 @@ mod tests {
         let requests = mock.take_requests();
         assert_eq!(
             requests[0].url,
-            "https://mock/webman/sso/SSOAccessToken.cgi"
+            "https://nas.example.com:5001/webman/sso/SSOAccessToken.cgi"
         );
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("code_verifier".into(), "verifier".into())));

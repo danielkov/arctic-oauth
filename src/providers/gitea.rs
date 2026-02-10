@@ -4,6 +4,38 @@ use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
 use crate::tokens::OAuth2Tokens;
 
+/// Configuration for creating a [`Gitea`] client with a custom HTTP client.
+///
+/// Use this when you need to provide your own [`HttpClient`] implementation
+/// (e.g. a pre-configured `reqwest::Client` with custom timeouts or proxies).
+/// For the common case, use [`Gitea::new`] which uses the built-in default client.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Gitea, GiteaOptions, HttpClient};
+///
+/// let custom_client = reqwest::Client::builder()
+///     .timeout(std::time::Duration::from_secs(10))
+///     .build()
+///     .unwrap();
+///
+/// let gitea = Gitea::from_options(GiteaOptions {
+///     base_url: "https://gitea.example.com".into(),
+///     client_id: "your-client-id".into(),
+///     client_secret: Some("your-client-secret".into()),
+///     redirect_uri: "https://example.com/callback".into(),
+///     http_client: &custom_client,
+/// });
+/// ```
+pub struct GiteaOptions<'a, H: HttpClient> {
+    pub base_url: String,
+    pub client_id: String,
+    pub client_secret: Option<String>,
+    pub redirect_uri: String,
+    pub http_client: &'a H,
+}
+
 /// OAuth 2.0 client for [Gitea](https://docs.gitea.com/development/oauth2-provider).
 ///
 /// Gitea requires PKCE with the S256 challenge method on all authorization requests.
@@ -32,7 +64,7 @@ use crate::tokens::OAuth2Tokens;
 /// # Example
 ///
 /// ```rust
-/// use arctic_oauth::{Gitea, ReqwestClient, generate_state, generate_code_verifier};
+/// use arctic_oauth::{Gitea, generate_state, generate_code_verifier};
 ///
 /// # async fn example() -> Result<(), arctic_oauth::Error> {
 /// let gitea = Gitea::new(
@@ -49,27 +81,66 @@ use crate::tokens::OAuth2Tokens;
 /// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
 ///
 /// // Step 2: In your callback handler, exchange the authorization code for tokens.
-/// let http = ReqwestClient::new();
 /// let tokens = gitea
-///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .validate_authorization_code("authorization-code", &code_verifier)
 ///     .await?;
 /// println!("Access token: {}", tokens.access_token()?);
 ///
 /// // Step 3 (optional): Refresh an expired access token.
 /// let refreshed = gitea
-///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .refresh_access_token(tokens.refresh_token()?)
 ///     .await?;
 /// # Ok(())
 /// # }
 /// ```
-pub struct Gitea {
+pub struct Gitea<'a, H: HttpClient> {
     client: OAuth2Client,
+    http_client: &'a H,
     authorization_endpoint: String,
     token_endpoint: String,
 }
 
-impl Gitea {
+impl<'a, H: HttpClient> Gitea<'a, H> {
+    /// Creates a Gitea client from a [`GiteaOptions`] struct.
+    ///
+    /// Use this when you need a custom HTTP client. For the common case,
+    /// use [`Gitea::new`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Gitea, GiteaOptions};
+    ///
+    /// let custom_client = reqwest::Client::new();
+    /// let gitea = Gitea::from_options(GiteaOptions {
+    ///     base_url: "https://gitea.example.com".into(),
+    ///     client_id: "your-client-id".into(),
+    ///     client_secret: Some("your-client-secret".into()),
+    ///     redirect_uri: "https://example.com/callback".into(),
+    ///     http_client: &custom_client,
+    /// });
+    /// ```
+    pub fn from_options(options: GiteaOptions<'a, H>) -> Self {
+        let base = options.base_url;
+        Self {
+            http_client: options.http_client,
+            client: OAuth2Client::new(
+                options.client_id,
+                options.client_secret,
+                Some(options.redirect_uri),
+            ),
+            authorization_endpoint: format!("{base}/login/oauth/authorize"),
+            token_endpoint: format!("{base}/login/oauth/access_token"),
+        }
+    }
+}
+
+#[cfg(feature = "reqwest-client")]
+impl Gitea<'static, reqwest::Client> {
     /// Creates a new Gitea OAuth 2.0 client for a specific Gitea instance.
+    ///
+    /// Uses the built-in `reqwest::Client` for HTTP requests. To provide a custom
+    /// HTTP client, use [`Gitea::from_options`] instead.
     ///
     /// # Arguments
     ///
@@ -96,16 +167,17 @@ impl Gitea {
         client_secret: Option<String>,
         redirect_uri: impl Into<String>,
     ) -> Self {
-        let base = base_url.into();
-        Self {
-            client: OAuth2Client::new(client_id, client_secret, Some(redirect_uri.into())),
-            authorization_endpoint: format!("{base}/login/oauth/authorize"),
-            token_endpoint: format!("{base}/login/oauth/access_token"),
-        }
+        Self::from_options(GiteaOptions {
+            base_url: base_url.into(),
+            client_id: client_id.into(),
+            client_secret,
+            redirect_uri: redirect_uri.into(),
+            http_client: crate::http::default_client(),
+        })
     }
 }
 
-impl Gitea {
+impl<'a, H: HttpClient> Gitea<'a, H> {
     /// Returns the provider name (`"Gitea"`).
     pub fn name(&self) -> &'static str {
         "Gitea"
@@ -137,12 +209,7 @@ impl Gitea {
     /// let url = gitea.authorization_url(&state, &["user"], &verifier);
     /// assert!(url.as_str().contains("/login/oauth/authorize"));
     /// ```
-    pub fn authorization_url(
-        &self,
-        state: &str,
-        scopes: &[&str],
-        code_verifier: &str,
-    ) -> url::Url {
+    pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
         self.client.create_authorization_url_with_pkce(
             &self.authorization_endpoint,
             state,
@@ -160,8 +227,6 @@ impl Gitea {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
-    ///   [`ReqwestClient`](crate::ReqwestClient)).
     /// * `code` - The authorization code from the `code` query parameter.
     /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
     ///
@@ -173,13 +238,12 @@ impl Gitea {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Gitea, ReqwestClient};
+    /// # use arctic_oauth::Gitea;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let gitea = Gitea::new("https://gitea.example.com", "client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let tokens = gitea
-    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .validate_authorization_code("the-auth-code", "the-code-verifier")
     ///     .await?;
     ///
     /// println!("Access token: {}", tokens.access_token()?);
@@ -188,13 +252,12 @@ impl Gitea {
     /// ```
     pub async fn validate_authorization_code(
         &self,
-        http_client: &(impl HttpClient + ?Sized),
         code: &str,
         code_verifier: &str,
     ) -> Result<OAuth2Tokens, Error> {
         self.client
             .validate_authorization_code(
-                http_client,
+                self.http_client,
                 &self.token_endpoint,
                 code,
                 Some(code_verifier),
@@ -210,7 +273,6 @@ impl Gitea {
     ///
     /// # Arguments
     ///
-    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
     /// * `refresh_token` - The refresh token from a previous token response.
     ///
     /// # Errors
@@ -221,26 +283,21 @@ impl Gitea {
     /// # Example
     ///
     /// ```rust
-    /// # use arctic_oauth::{Gitea, ReqwestClient};
+    /// # use arctic_oauth::Gitea;
     /// # async fn example() -> Result<(), arctic_oauth::Error> {
     /// let gitea = Gitea::new("https://gitea.example.com", "client-id", Some("secret".into()), "https://example.com/cb");
-    /// let http = ReqwestClient::new();
     ///
     /// let new_tokens = gitea
-    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .refresh_access_token("stored-refresh-token")
     ///     .await?;
     ///
     /// println!("New access token: {}", new_tokens.access_token()?);
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn refresh_access_token(
-        &self,
-        http_client: &(impl HttpClient + ?Sized),
-        refresh_token: &str,
-    ) -> Result<OAuth2Tokens, Error> {
+    pub async fn refresh_access_token(&self, refresh_token: &str) -> Result<OAuth2Tokens, Error> {
         self.client
-            .refresh_access_token(http_client, &self.token_endpoint, refresh_token, &[])
+            .refresh_access_token(self.http_client, &self.token_endpoint, refresh_token, &[])
             .await
     }
 }
@@ -286,9 +343,20 @@ mod tests {
             .collect()
     }
 
+    fn make_gitea(http_client: &MockHttpClient) -> Gitea<'_, MockHttpClient> {
+        Gitea::from_options(GiteaOptions {
+            base_url: "https://gitea.example.com".into(),
+            client_id: "cid".into(),
+            client_secret: None,
+            redirect_uri: "https://app/cb".into(),
+            http_client,
+        })
+    }
+
     #[test]
     fn new_builds_endpoints_from_base_url() {
-        let gitea = Gitea::new("https://gitea.example.com", "cid", None, "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let gitea = make_gitea(&mock);
         assert_eq!(
             gitea.authorization_endpoint,
             "https://gitea.example.com/login/oauth/authorize"
@@ -301,13 +369,15 @@ mod tests {
 
     #[test]
     fn name_returns_gitea() {
-        let gitea = Gitea::new("https://gitea.example.com", "cid", None, "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let gitea = make_gitea(&mock);
         assert_eq!(gitea.name(), "Gitea");
     }
 
     #[test]
     fn authorization_url_includes_pkce() {
-        let gitea = Gitea::new("https://gitea.example.com", "cid", None, "https://app/cb");
+        let mock = MockHttpClient::new(vec![]);
+        let gitea = make_gitea(&mock);
         let url = gitea.authorization_url("state123", &["repo"], "my-verifier");
 
         let pairs: Vec<(String, String)> = url.query_pairs().into_owned().collect();
@@ -319,7 +389,6 @@ mod tests {
 
     #[tokio::test]
     async fn validate_authorization_code_sends_verifier() {
-        let gitea = Gitea::new("https://mock", "cid", Some("secret".into()), "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -328,23 +397,26 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let gitea = make_gitea(&mock);
 
         let tokens = gitea
-            .validate_authorization_code(&mock, "code", "verifier")
+            .validate_authorization_code("code", "verifier")
             .await
             .unwrap();
 
         assert_eq!(tokens.access_token().unwrap(), "gitea-tok");
 
         let requests = mock.take_requests();
-        assert_eq!(requests[0].url, "https://mock/login/oauth/access_token");
+        assert_eq!(
+            requests[0].url,
+            "https://gitea.example.com/login/oauth/access_token"
+        );
         let body = parse_form_body(&requests[0]);
         assert!(body.contains(&("code_verifier".into(), "verifier".into())));
     }
 
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
-        let gitea = Gitea::new("https://mock", "cid", Some("secret".into()), "https://app/cb");
         let mock = MockHttpClient::new(vec![HttpResponse {
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
@@ -353,8 +425,9 @@ mod tests {
             }))
             .unwrap(),
         }]);
+        let gitea = make_gitea(&mock);
 
-        let tokens = gitea.refresh_access_token(&mock, "rt").await.unwrap();
+        let tokens = gitea.refresh_access_token("rt").await.unwrap();
         assert_eq!(tokens.access_token().unwrap(), "new-tok");
     }
 }
