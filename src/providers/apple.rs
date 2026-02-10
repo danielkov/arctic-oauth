@@ -10,6 +10,63 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://appleid.apple.com/auth/authorize";
 const TOKEN_ENDPOINT: &str = "https://appleid.apple.com/auth/token";
 
+/// OAuth 2.0 client for [Sign in with Apple](https://developer.apple.com/sign-in-with-apple/).
+///
+/// Apple uses a unique authentication approach that requires a dynamically generated JWT
+/// client secret signed with your private key. This client handles JWT generation internally
+/// and supports the authorization code flow with refresh tokens.
+///
+/// # Setup
+///
+/// 1. Register for an Apple Developer account at <https://developer.apple.com/>.
+/// 2. Create an **App ID** in the Apple Developer portal and enable **Sign in with Apple**.
+/// 3. Create a **Services ID** (this becomes your `client_id`) and configure the redirect URI.
+/// 4. Create a **Private Key** for Sign in with Apple and download the `.p8` file.
+/// 5. Note your **Team ID** and **Key ID** from the portal.
+/// 6. Convert the `.p8` key to PKCS#8 DER format for use with this client.
+///
+/// # Scopes
+///
+/// Apple uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `name` | User's full name |
+/// | `email` | User's email address |
+///
+/// See the full documentation at <https://developer.apple.com/documentation/sign_in_with_apple/clientconfigi/3230955-scope>.
+///
+/// # Example
+///
+/// ```rust,no_run
+/// use arctic_oauth::{Apple, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// // Load your Apple private key in PKCS#8 DER format
+/// let private_key = std::fs::read("apple_private_key.p8")?;
+///
+/// let apple = Apple::new(
+///     "com.example.myapp",        // Services ID (client_id)
+///     "ABC123DEF4",                // Team ID
+///     "XYZ987WVU6",                // Key ID
+///     &private_key,                // PKCS#8 DER-encoded private key
+///     "https://example.com/callback",
+/// )?;
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = apple.authorization_url(&state, &["name", "email"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = apple
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct Apple {
     client_id: String,
     team_id: String,
@@ -21,6 +78,38 @@ pub struct Apple {
 }
 
 impl Apple {
+    /// Creates a new Apple OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The Services ID from Apple Developer portal.
+    /// * `team_id` - Your Apple Developer Team ID.
+    /// * `key_id` - The Key ID associated with your Sign in with Apple private key.
+    /// * `pkcs8_private_key` - Your private key in PKCS#8 DER format (the contents of the `.p8` file converted to DER).
+    /// * `redirect_uri` - The URI Apple will redirect to after authorization. Must match
+    ///   one of the redirect URIs configured in your Services ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the private key is not valid PKCS#8 DER-encoded data.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// use arctic_oauth::Apple;
+    ///
+    /// # fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let private_key = std::fs::read("apple_key.p8")?;
+    /// let apple = Apple::new(
+    ///     "com.example.myapp",
+    ///     "ABC123DEF4",
+    ///     "XYZ987WVU6",
+    ///     &private_key,
+    ///     "https://example.com/callback",
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         team_id: impl Into<String>,
@@ -44,6 +133,34 @@ impl Apple {
 
 #[cfg(any(test, feature = "testing"))]
 impl Apple {
+    /// Creates an Apple client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Apple;
+    ///
+    /// # fn example() -> Result<(), arctic_oauth::Error> {
+    /// # let test_key = vec![0u8; 32];
+    /// let apple = Apple::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-team-id",
+    ///     "test-key-id",
+    ///     &test_key,
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// )?;
+    /// # Ok(())
+    /// # }
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         team_id: impl Into<String>,
@@ -68,10 +185,38 @@ impl Apple {
 }
 
 impl Apple {
+    /// Returns the provider name (`"Apple"`).
     pub fn name(&self) -> &'static str {
         "Apple"
     }
 
+    /// Builds the Apple authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to validate the callback. Apple does not require PKCE for this flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["name", "email"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Apple, generate_state};
+    ///
+    /// # fn example() -> Result<(), arctic_oauth::Error> {
+    /// # let test_key = vec![0u8; 32];
+    /// let apple = Apple::new("client-id", "team-id", "key-id", &test_key, "https://example.com/cb")?;
+    /// let state = generate_state();
+    ///
+    /// let url = apple.authorization_url(&state, &["name", "email"]);
+    /// assert!(url.as_str().starts_with("https://appleid.apple.com/"));
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -123,6 +268,40 @@ impl Apple {
         format!("{signing_input}.{signature_encoded}")
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Apple redirects back with a `code`
+    /// query parameter. This method automatically generates a JWT client secret signed
+    /// with your private key and includes it in the token request.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Apple rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Apple, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// # let test_key = vec![0u8; 32];
+    /// let apple = Apple::new("client-id", "team-id", "key-id", &test_key, "https://example.com/cb")?;
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = apple
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

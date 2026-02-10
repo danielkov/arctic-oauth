@@ -4,6 +4,69 @@ use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
 use crate::tokens::OAuth2Tokens;
 
+/// OAuth 2.0 client for [Keycloak](https://www.keycloak.org/docs/latest/securing_apps/#_oidc).
+///
+/// Keycloak requires PKCE with the S256 challenge method on all authorization requests.
+/// This client supports self-hosted Keycloak instances by allowing you to specify a
+/// realm-specific URL. The client supports the full authorization code flow including
+/// token refresh and revocation.
+///
+/// # Setup
+///
+/// 1. In your Keycloak admin console, create or select a realm.
+/// 2. Go to **Clients** and create a new OpenID Connect client.
+/// 3. Note your **Client ID** and **Client Secret** (if using confidential access type).
+/// 4. Add your redirect URI to the **Valid Redirect URIs** setting.
+///
+/// # Scopes
+///
+/// Keycloak uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `openid` | OpenID Connect authentication |
+/// | `profile` | User's profile information |
+/// | `email` | User's email address |
+/// | `offline_access` | Request a refresh token |
+///
+/// See your Keycloak realm's client scope configuration for available scopes.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{KeyCloak, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let keycloak = KeyCloak::new(
+///     "https://keycloak.example.com/realms/myrealm",
+///     "your-client-id",
+///     Some("your-client-secret".into()),
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = keycloak.authorization_url(&state, &["openid", "profile", "email"], &code_verifier);
+/// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = keycloak
+///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = keycloak
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+///
+/// // Step 4 (optional): Revoke a token.
+/// keycloak.revoke_token(&http, tokens.access_token()?).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct KeyCloak {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -12,6 +75,29 @@ pub struct KeyCloak {
 }
 
 impl KeyCloak {
+    /// Creates a new Keycloak OAuth 2.0 client for a specific realm.
+    ///
+    /// # Arguments
+    ///
+    /// * `realm_url` - The full URL to the Keycloak realm (e.g.
+    ///   `"https://keycloak.example.com/realms/myrealm"`). This should include the
+    ///   `/realms/{realm-name}` path.
+    /// * `client_id` - The OAuth 2.0 client ID from Keycloak.
+    /// * `client_secret` - Optional client secret. Use `None` for public clients.
+    /// * `redirect_uri` - The URI Keycloak will redirect to after authorization.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::KeyCloak;
+    ///
+    /// let keycloak = KeyCloak::new(
+    ///     "https://keycloak.example.com/realms/myrealm",
+    ///     "your-client-id",
+    ///     Some("your-client-secret".into()),
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         realm_url: impl Into<String>,
         client_id: impl Into<String>,
@@ -29,10 +115,37 @@ impl KeyCloak {
 }
 
 impl KeyCloak {
+    /// Returns the provider name (`"KeyCloak"`).
     pub fn name(&self) -> &'static str {
         "KeyCloak"
     }
 
+    /// Builds the Keycloak authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 and PKCE parameters. Your
+    /// application should store `state` and `code_verifier` in the user's session
+    /// before redirecting, as both are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["openid", "profile", "email"]`).
+    /// * `code_verifier` - The PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{KeyCloak, generate_state, generate_code_verifier};
+    ///
+    /// let keycloak = KeyCloak::new("https://kc.example.com/realms/r", "client-id", None, "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = keycloak.authorization_url(&state, &["openid"], &verifier);
+    /// assert!(url.as_str().contains("/protocol/openid-connect/auth"));
+    /// ```
     pub fn authorization_url(
         &self,
         state: &str,
@@ -48,6 +161,40 @@ impl KeyCloak {
         )
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Keycloak redirects back with a `code`
+    /// query parameter. The `code_verifier` must be the same value used to generate the
+    /// authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Keycloak rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{KeyCloak, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let keycloak = KeyCloak::new("https://kc.example.com/realms/r", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = keycloak
+    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -64,6 +211,38 @@ impl KeyCloak {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Keycloak access tokens expire after a configurable period (often 5-15 minutes).
+    /// If your initial token response included a refresh token (requires `offline_access`
+    /// scope), you can use it to obtain a new access token without user interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{KeyCloak, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let keycloak = KeyCloak::new("https://kc.example.com/realms/r", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = keycloak
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -74,6 +253,33 @@ impl KeyCloak {
             .await
     }
 
+    /// Revokes an access token or refresh token.
+    ///
+    /// Use this when a user signs out or disconnects your application. Keycloak will
+    /// invalidate the token and prevent further use.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `token` - The access token or refresh token to revoke.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedResponse`] if Keycloak returns a non-200 status, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{KeyCloak, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let keycloak = KeyCloak::new("https://kc.example.com/realms/r", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// keycloak.revoke_token(&http, "token-to-revoke").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

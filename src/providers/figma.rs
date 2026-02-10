@@ -7,6 +7,62 @@ const AUTHORIZATION_ENDPOINT: &str = "https://www.figma.com/oauth";
 const TOKEN_ENDPOINT: &str = "https://api.figma.com/v1/oauth/token";
 const REFRESH_ENDPOINT: &str = "https://api.figma.com/v1/oauth/refresh";
 
+/// OAuth 2.0 client for [Figma](https://www.figma.com/developers/api#oauth2).
+///
+/// Figma does not require PKCE. This client supports the full authorization code flow
+/// including token refresh. Note that Figma uses a separate endpoint for token refresh.
+///
+/// # Setup
+///
+/// 1. Go to your [Figma account settings](https://www.figma.com/developers/apps).
+/// 2. Click **Create a new app** and configure your OAuth application.
+/// 3. Set the callback URL to match the `redirect_uri` you pass to [`Figma::new`].
+/// 4. Note your Client ID and Client Secret.
+///
+/// # Scopes
+///
+/// Figma uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `file_read` | Read files and comments |
+/// | `file_write` | Edit files |
+/// | `file_variables:read` | Read variables |
+/// | `file_variables:write` | Write variables |
+///
+/// See the full list at <https://www.figma.com/developers/api#oauth2-scopes>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Figma, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let figma = Figma::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let url = figma.authorization_url(&state, &["file_read"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = figma
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = figma
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Figma {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -15,6 +71,26 @@ pub struct Figma {
 }
 
 impl Figma {
+    /// Creates a new Figma OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from your Figma app settings.
+    /// * `client_secret` - The OAuth 2.0 client secret from your Figma app settings.
+    /// * `redirect_uri` - The URI Figma will redirect to after authorization. Must match
+    ///   the callback URL configured in your Figma app.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Figma;
+    ///
+    /// let figma = Figma::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -35,6 +111,29 @@ impl Figma {
 
 #[cfg(any(test, feature = "testing"))]
 impl Figma {
+    /// Creates a Figma client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Figma;
+    ///
+    /// let figma = Figma::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    ///     "http://localhost:8080/refresh",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -57,15 +156,70 @@ impl Figma {
 }
 
 impl Figma {
+    /// Returns the provider name (`"Figma"`).
     pub fn name(&self) -> &'static str {
         "Figma"
     }
 
+    /// Builds the Figma authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application should
+    /// store `state` in the user's session before redirecting.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["file_read"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Figma, generate_state};
+    ///
+    /// let figma = Figma::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = figma.authorization_url(&state, &["file_read"]);
+    /// assert!(url.as_str().starts_with("https://www.figma.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         self.client
             .create_authorization_url(&self.authorization_endpoint, state, scopes)
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Figma redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Figma rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Figma, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let figma = Figma::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = figma
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -76,6 +230,38 @@ impl Figma {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Figma access tokens typically expire after 90 days. Use this method to obtain a new
+    /// access token without user interaction. Note that Figma uses a separate endpoint
+    /// for token refresh.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Figma, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let figma = Figma::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = figma
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

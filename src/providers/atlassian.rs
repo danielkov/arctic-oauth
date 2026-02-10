@@ -6,6 +6,64 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://auth.atlassian.com/authorize";
 const TOKEN_ENDPOINT: &str = "https://auth.atlassian.com/oauth/token";
 
+/// OAuth 2.0 client for [Atlassian](https://developer.atlassian.com/cloud/jira/platform/oauth-2-3lo-apps/).
+///
+/// Atlassian does not require PKCE. The authorization URL automatically includes
+/// `audience=api.atlassian.com` and `prompt=consent` as required by Atlassian's OAuth 2.0
+/// implementation. This client supports the full authorization code flow including token refresh.
+///
+/// # Setup
+///
+/// 1. Go to the [Atlassian Developer Console](https://developer.atlassian.com/console/myapps/).
+/// 2. Create a new app and configure OAuth 2.0 settings.
+/// 3. Add the callback URL to match the `redirect_uri` you pass to [`Atlassian::new`].
+/// 4. Note your Client ID and Client Secret.
+///
+/// # Scopes
+///
+/// Atlassian uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `read:jira-work` | Read Jira work data |
+/// | `write:jira-work` | Write Jira work data |
+/// | `read:confluence-content.all` | Read Confluence content |
+/// | `write:confluence-content` | Write Confluence content |
+/// | `offline_access` | Request refresh tokens |
+///
+/// See the full list at <https://developer.atlassian.com/cloud/jira/platform/scopes-for-oauth-2-3LO-and-forge-apps/>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Atlassian, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let atlassian = Atlassian::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let url = atlassian.authorization_url(&state, &["read:jira-work", "offline_access"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = atlassian
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = atlassian
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Atlassian {
     client_id: String,
     client_secret: String,
@@ -15,6 +73,26 @@ pub struct Atlassian {
 }
 
 impl Atlassian {
+    /// Creates a new Atlassian OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from the Atlassian Developer Console.
+    /// * `client_secret` - The OAuth 2.0 client secret from the Atlassian Developer Console.
+    /// * `redirect_uri` - The URI Atlassian will redirect to after authorization. Must match
+    ///   one of the callback URLs configured in your Atlassian app.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Atlassian;
+    ///
+    /// let atlassian = Atlassian::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +110,28 @@ impl Atlassian {
 
 #[cfg(any(test, feature = "testing"))]
 impl Atlassian {
+    /// Creates an Atlassian client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Atlassian;
+    ///
+    /// let atlassian = Atlassian::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,10 +150,34 @@ impl Atlassian {
 }
 
 impl Atlassian {
+    /// Returns the provider name (`"Atlassian"`).
     pub fn name(&self) -> &'static str {
         "Atlassian"
     }
 
+    /// Builds the Atlassian authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters, plus Atlassian-specific
+    /// `audience=api.atlassian.com` and `prompt=consent` parameters. Your application should
+    /// store `state` in the user's session before redirecting.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["read:jira-work", "offline_access"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Atlassian, generate_state};
+    ///
+    /// let atlassian = Atlassian::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = atlassian.authorization_url(&state, &["read:jira-work"]);
+    /// assert!(url.as_str().starts_with("https://auth.atlassian.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -76,6 +200,39 @@ impl Atlassian {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Atlassian redirects back with a `code`
+    /// query parameter. Atlassian-specific: credentials are sent in the POST body (not via
+    /// Basic auth).
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Atlassian rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Atlassian, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let atlassian = Atlassian::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = atlassian
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -93,6 +250,37 @@ impl Atlassian {
         send_token_request(http_client, request).await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Use this to obtain a new access token without user interaction. To receive a refresh
+    /// token in the initial authorization, include the `offline_access` scope.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Atlassian, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let atlassian = Atlassian::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = atlassian
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

@@ -4,6 +4,72 @@ use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
 use crate::tokens::OAuth2Tokens;
 
+/// OAuth 2.0 client for [Salesforce](https://help.salesforce.com/s/articleView?id=sf.remoteaccess_oauth_web_server_flow.htm).
+///
+/// Salesforce requires PKCE with the S256 challenge method for authorization requests.
+/// This client supports the full authorization code flow including token refresh and
+/// revocation. The client secret is optional for public clients. Unlike most providers,
+/// Salesforce requires you to specify the authentication domain (e.g., `login.salesforce.com`
+/// for production or `test.salesforce.com` for sandboxes).
+///
+/// # Setup
+///
+/// 1. Create a Connected App in your Salesforce org via **Setup > Apps > App Manager**.
+/// 2. Enable **OAuth Settings** and configure the callback URL to match the `redirect_uri`
+///    you pass to [`Salesforce::new`].
+/// 3. Select the required **OAuth Scopes** for your application.
+/// 4. Obtain your **Consumer Key** (Client ID) and **Consumer Secret** (Client Secret).
+///
+/// # Scopes
+///
+/// Salesforce uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `api` | Access to REST API resources |
+/// | `refresh_token` | Enable refresh tokens |
+/// | `openid` | OpenID Connect authentication |
+/// | `profile` | Access to user profile |
+/// | `full` | Full access to all data (use with caution) |
+///
+/// See the full list at <https://help.salesforce.com/s/articleView?id=sf.remoteaccess_oauth_tokens_scopes.htm>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Salesforce, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let salesforce = Salesforce::new(
+///     "login.salesforce.com",  // Use "test.salesforce.com" for sandboxes
+///     "your-consumer-key",
+///     Some("your-consumer-secret".into()),
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = salesforce.authorization_url(&state, &["api", "refresh_token"], &code_verifier);
+/// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = salesforce
+///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = salesforce
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+///
+/// // Step 4 (optional): Revoke a token.
+/// salesforce.revoke_token(&http, tokens.access_token()?).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Salesforce {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -12,6 +78,46 @@ pub struct Salesforce {
 }
 
 impl Salesforce {
+    /// Creates a new Salesforce OAuth 2.0 client configured for the specified domain.
+    ///
+    /// # Arguments
+    ///
+    /// * `domain` - The Salesforce authentication domain (e.g., `"login.salesforce.com"` for
+    ///   production orgs, `"test.salesforce.com"` for sandboxes, or your custom My Domain).
+    /// * `client_id` - The Consumer Key from your Connected App.
+    /// * `client_secret` - The Consumer Secret (optional for public clients).
+    /// * `redirect_uri` - The URI Salesforce will redirect to after authorization. Must match
+    ///   one of the callback URLs configured in your Connected App.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Salesforce;
+    ///
+    /// // Production org
+    /// let salesforce = Salesforce::new(
+    ///     "login.salesforce.com",
+    ///     "your-consumer-key",
+    ///     Some("your-consumer-secret".into()),
+    ///     "https://example.com/callback",
+    /// );
+    ///
+    /// // Sandbox org
+    /// let salesforce_sandbox = Salesforce::new(
+    ///     "test.salesforce.com",
+    ///     "your-consumer-key",
+    ///     Some("your-consumer-secret".into()),
+    ///     "https://example.com/callback",
+    /// );
+    ///
+    /// // Public client (no secret)
+    /// let salesforce_public = Salesforce::new(
+    ///     "login.salesforce.com",
+    ///     "your-consumer-key",
+    ///     None,
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         domain: impl Into<String>,
         client_id: impl Into<String>,
@@ -29,10 +135,42 @@ impl Salesforce {
 }
 
 impl Salesforce {
+    /// Returns the provider name (`"Salesforce"`).
     pub fn name(&self) -> &'static str {
         "Salesforce"
     }
 
+    /// Builds the Salesforce authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 and PKCE parameters. Your
+    /// application should store `state` and `code_verifier` in the user's session
+    /// before redirecting, as both are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["api", "refresh_token"]`).
+    /// * `code_verifier` - The PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Salesforce, generate_state, generate_code_verifier};
+    ///
+    /// let salesforce = Salesforce::new(
+    ///     "login.salesforce.com",
+    ///     "client-id",
+    ///     None,
+    ///     "https://example.com/cb"
+    /// );
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = salesforce.authorization_url(&state, &["api", "refresh_token"], &verifier);
+    /// assert!(url.as_str().starts_with("https://login.salesforce.com/"));
+    /// ```
     pub fn authorization_url(
         &self,
         state: &str,
@@ -48,6 +186,45 @@ impl Salesforce {
         )
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Salesforce redirects back with a `code`
+    /// query parameter. The `code_verifier` must be the same value used to generate the
+    /// authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Salesforce rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Salesforce, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let salesforce = Salesforce::new(
+    ///     "login.salesforce.com",
+    ///     "client-id",
+    ///     Some("secret".into()),
+    ///     "https://example.com/cb"
+    /// );
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = salesforce
+    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -64,6 +241,44 @@ impl Salesforce {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Salesforce access tokens do not have a fixed expiration time but may be invalidated
+    /// due to various reasons. If you requested the `refresh_token` scope and your initial
+    /// token response included a refresh token, you can use it to obtain a new access token
+    /// without user interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Salesforce, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let salesforce = Salesforce::new(
+    ///     "login.salesforce.com",
+    ///     "client-id",
+    ///     Some("secret".into()),
+    ///     "https://example.com/cb"
+    /// );
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = salesforce
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -74,6 +289,38 @@ impl Salesforce {
             .await
     }
 
+    /// Revokes an access token or refresh token.
+    ///
+    /// Use this when a user signs out or disconnects your application. Revoking a token
+    /// invalidates it immediately.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `token` - The access token or refresh token to revoke.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Salesforce rejects the request, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Salesforce, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let salesforce = Salesforce::new(
+    ///     "login.salesforce.com",
+    ///     "client-id",
+    ///     Some("secret".into()),
+    ///     "https://example.com/cb"
+    /// );
+    /// let http = ReqwestClient::new();
+    ///
+    /// salesforce.revoke_token(&http, "token-to-revoke").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

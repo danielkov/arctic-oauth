@@ -6,6 +6,55 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://api.notion.com/v1/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.notion.com/v1/oauth/token";
 
+/// OAuth 2.0 client for [Notion](https://developers.notion.com/docs/authorization).
+///
+/// Notion does not require PKCE and does not use OAuth scopes. This client supports
+/// the authorization code flow for obtaining access tokens. Note that Notion access
+/// tokens do not expire, and Notion does not provide token refresh or revocation
+/// endpoints.
+///
+/// # Setup
+///
+/// 1. Create an integration in the [Notion integrations page](https://www.notion.so/my-integrations).
+/// 2. Choose **Public integration** and configure OAuth settings.
+/// 3. Copy your OAuth client ID and OAuth client secret.
+/// 4. Add the redirect URI to match the `redirect_uri` you pass to [`Notion::new`].
+///
+/// # Scopes
+///
+/// Notion does not use traditional OAuth 2.0 scopes. Instead, you configure capabilities
+/// during integration creation (such as read content, update content, insert content).
+/// These capabilities determine what your integration can access once a user grants
+/// authorization.
+///
+/// See <https://developers.notion.com/docs/authorization#capabilities> for more details.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Notion, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let notion = Notion::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = notion.authorization_url(&state);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: Exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = notion
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct Notion {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -13,6 +62,26 @@ pub struct Notion {
 }
 
 impl Notion {
+    /// Creates a new Notion OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from Notion's integration settings.
+    /// * `client_secret` - The OAuth 2.0 client secret from Notion's integration settings.
+    /// * `redirect_uri` - The URI Notion will redirect to after authorization.
+    ///   Must match one configured in your integration settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Notion;
+    ///
+    /// let notion = Notion::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +101,28 @@ impl Notion {
 
 #[cfg(any(test, feature = "testing"))]
 impl Notion {
+    /// Creates a Notion client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Notion;
+    ///
+    /// let notion = Notion::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -52,10 +143,35 @@ impl Notion {
 }
 
 impl Notion {
+    /// Returns the provider name (`"Notion"`).
     pub fn name(&self) -> &'static str {
         "Notion"
     }
 
+    /// Builds the Notion authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to prevent CSRF attacks.
+    ///
+    /// Note: This method automatically includes `owner=user` in the authorization URL,
+    /// which is required by Notion's OAuth implementation.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token. Use [`generate_state`](crate::generate_state) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Notion, generate_state};
+    ///
+    /// let notion = Notion::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = notion.authorization_url(&state);
+    /// assert!(url.as_str().starts_with("https://api.notion.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str) -> url::Url {
         let mut url = self
             .client
@@ -64,6 +180,39 @@ impl Notion {
         url
     }
 
+    /// Exchanges an authorization code for an access token.
+    ///
+    /// Call this in your redirect URI handler after Notion redirects back with a `code`
+    /// query parameter. Note that Notion access tokens do not expire and no refresh
+    /// token is provided.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Notion rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Notion, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let notion = Notion::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = notion
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

@@ -8,6 +8,68 @@ const AUTHORIZATION_ENDPOINT: &str = "https://www.tiktok.com/v2/auth/authorize/"
 const TOKEN_ENDPOINT: &str = "https://open.tiktokapis.com/v2/oauth/token/";
 const REVOCATION_ENDPOINT: &str = "https://open.tiktokapis.com/v2/oauth/revoke/";
 
+/// OAuth 2.0 client for [TikTok for Developers](https://developers.tiktok.com/).
+///
+/// TikTok requires PKCE with the S256 challenge method on all authorization requests
+/// and uses `client_key` instead of the standard `client_id` parameter. TikTok also
+/// returns errors with HTTP 200 status codes, which this client handles automatically.
+/// This client supports the full authorization code flow including token refresh and revocation.
+///
+/// # Setup
+///
+/// 1. Create a TikTok for Developers account at <https://developers.tiktok.com/>.
+/// 2. Create a new app in the [TikTok Developer Portal](https://developers.tiktok.com/apps).
+/// 3. Note your **Client Key** (this is your `client_id`) and **Client Secret**.
+/// 4. Configure the **Redirect URI** in your app settings to match the `redirect_uri` you pass to [`TikTok::new`].
+/// 5. Add the required scopes/permissions to your app.
+///
+/// # Scopes
+///
+/// TikTok uses comma-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `user.info.basic` | User's basic profile information |
+/// | `video.list` | List user's videos |
+/// | `video.upload` | Upload videos on behalf of the user |
+///
+/// See the full list at <https://developers.tiktok.com/doc/login-kit-manage-user-access-tokens>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{TikTok, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let tiktok = TikTok::new(
+///     "your-client-key",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = tiktok.authorization_url(&state, &["user.info.basic", "video.list"], &code_verifier);
+/// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = tiktok
+///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = tiktok
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+///
+/// // Step 4 (optional): Revoke a token.
+/// tiktok.revoke_token(&http, tokens.access_token()?).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct TikTok {
     client_id: String,
     client_secret: String,
@@ -18,6 +80,26 @@ pub struct TikTok {
 }
 
 impl TikTok {
+    /// Creates a new TikTok OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The Client Key from TikTok Developer Portal.
+    /// * `client_secret` - The Client Secret from TikTok Developer Portal.
+    /// * `redirect_uri` - The URI TikTok will redirect to after authorization. Must match
+    ///   one of the redirect URIs configured in your TikTok app settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::TikTok;
+    ///
+    /// let tiktok = TikTok::new(
+    ///     "your-client-key",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -36,6 +118,29 @@ impl TikTok {
 
 #[cfg(any(test, feature = "testing"))]
 impl TikTok {
+    /// Creates a TikTok client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::TikTok;
+    ///
+    /// let tiktok = TikTok::with_endpoints(
+    ///     "test-client-key",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    ///     Some("http://localhost:8080/revoke"),
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -58,10 +163,38 @@ impl TikTok {
 }
 
 impl TikTok {
+    /// Returns the provider name (`"TikTok"`).
     pub fn name(&self) -> &'static str {
         "TikTok"
     }
 
+    /// Builds the TikTok authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 and PKCE parameters. Note that
+    /// TikTok uses comma-separated scopes and includes a `scope` parameter even when
+    /// the scope list is empty. Your application should store `state` and `code_verifier`
+    /// in the user's session before redirecting, as both are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["user.info.basic", "video.list"]`).
+    /// * `code_verifier` - The PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{TikTok, generate_state, generate_code_verifier};
+    ///
+    /// let tiktok = TikTok::new("client-key", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = tiktok.authorization_url(&state, &["user.info.basic"], &verifier);
+    /// assert!(url.as_str().starts_with("https://www.tiktok.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -81,6 +214,41 @@ impl TikTok {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after TikTok redirects back with a `code`
+    /// query parameter. The `code_verifier` must be the same value used to generate the
+    /// authorization URL. This method handles TikTok's non-standard error responses
+    /// (errors returned with HTTP 200 status).
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if TikTok rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{TikTok, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let tiktok = TikTok::new("client-key", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = tiktok
+    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -100,6 +268,39 @@ impl TikTok {
         self.parse_token_response(http_client, request).await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// TikTok access tokens expire after a period determined by the API. If your initial
+    /// token response included a refresh token, you can use it to obtain a new access
+    /// token without user interaction. This method handles TikTok's non-standard error
+    /// responses (errors returned with HTTP 200 status).
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{TikTok, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let tiktok = TikTok::new("client-key", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = tiktok
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -115,6 +316,34 @@ impl TikTok {
         self.parse_token_response(http_client, request).await
     }
 
+    /// Revokes an access token or refresh token.
+    ///
+    /// Use this when a user signs out or disconnects your application. TikTok
+    /// requires the token to be sent in the POST form body along with the client
+    /// credentials.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `token` - The access token or refresh token to revoke.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedResponse`] if TikTok returns a non-200 status, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{TikTok, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let tiktok = TikTok::new("client-key", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// tiktok.revoke_token(&http, "token-to-revoke").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

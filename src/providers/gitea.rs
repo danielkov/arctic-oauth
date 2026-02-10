@@ -4,6 +4,64 @@ use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
 use crate::tokens::OAuth2Tokens;
 
+/// OAuth 2.0 client for [Gitea](https://docs.gitea.com/development/oauth2-provider).
+///
+/// Gitea requires PKCE with the S256 challenge method on all authorization requests.
+/// This client supports self-hosted Gitea instances by allowing you to specify a
+/// custom base URL. The client supports the authorization code flow with token exchange
+/// and refresh.
+///
+/// # Setup
+///
+/// 1. In your Gitea instance, go to **Settings > Applications** (in user or organization settings).
+/// 2. Create a new OAuth2 application and note the **Client ID** and **Client Secret**.
+/// 3. Set the **Redirect URI** to match the `redirect_uri` you pass to [`Gitea::new`].
+///
+/// # Scopes
+///
+/// Gitea uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `user` | Full access to user profile |
+/// | `repo` | Access to repositories |
+/// | `write:repo` | Write access to repositories |
+///
+/// See your Gitea instance's OAuth documentation for the full list of available scopes.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Gitea, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let gitea = Gitea::new(
+///     "https://gitea.example.com",
+///     "your-client-id",
+///     Some("your-client-secret".into()),
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = gitea.authorization_url(&state, &["user", "repo"], &code_verifier);
+/// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = gitea
+///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = gitea
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Gitea {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -11,6 +69,27 @@ pub struct Gitea {
 }
 
 impl Gitea {
+    /// Creates a new Gitea OAuth 2.0 client for a specific Gitea instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_url` - The base URL of the Gitea instance (e.g. `"https://gitea.example.com"`).
+    /// * `client_id` - The OAuth 2.0 application ID from Gitea.
+    /// * `client_secret` - Optional client secret. Use `None` for public clients.
+    /// * `redirect_uri` - The URI Gitea will redirect to after authorization.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Gitea;
+    ///
+    /// let gitea = Gitea::new(
+    ///     "https://gitea.example.com",
+    ///     "your-client-id",
+    ///     Some("your-client-secret".into()),
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         base_url: impl Into<String>,
         client_id: impl Into<String>,
@@ -27,10 +106,37 @@ impl Gitea {
 }
 
 impl Gitea {
+    /// Returns the provider name (`"Gitea"`).
     pub fn name(&self) -> &'static str {
         "Gitea"
     }
 
+    /// Builds the Gitea authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 and PKCE parameters. Your
+    /// application should store `state` and `code_verifier` in the user's session
+    /// before redirecting, as both are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["user", "repo"]`).
+    /// * `code_verifier` - The PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Gitea, generate_state, generate_code_verifier};
+    ///
+    /// let gitea = Gitea::new("https://gitea.example.com", "client-id", None, "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = gitea.authorization_url(&state, &["user"], &verifier);
+    /// assert!(url.as_str().contains("/login/oauth/authorize"));
+    /// ```
     pub fn authorization_url(
         &self,
         state: &str,
@@ -46,6 +152,40 @@ impl Gitea {
         )
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Gitea redirects back with a `code`
+    /// query parameter. The `code_verifier` must be the same value used to generate the
+    /// authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Gitea rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Gitea, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let gitea = Gitea::new("https://gitea.example.com", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = gitea
+    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -62,6 +202,38 @@ impl Gitea {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Gitea access tokens expire after a configurable period. If your initial token response
+    /// included a refresh token, you can use it to obtain a new access token without user
+    /// interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Gitea, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let gitea = Gitea::new("https://gitea.example.com", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = gitea
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

@@ -7,6 +7,64 @@ const AUTHORIZATION_ENDPOINT: &str = "https://account.box.com/api/oauth2/authori
 const TOKEN_ENDPOINT: &str = "https://api.box.com/oauth2/token";
 const REVOCATION_ENDPOINT: &str = "https://api.box.com/oauth2/revoke";
 
+/// OAuth 2.0 client for [Box](https://developer.box.com/guides/authentication/oauth2/).
+///
+/// Box does not require PKCE. This client supports the authorization code flow including
+/// token refresh and revocation.
+///
+/// # Setup
+///
+/// 1. Create an application in the [Box Developer Console](https://app.box.com/developers/console).
+/// 2. Choose **Standard OAuth 2.0** as the authentication method.
+/// 3. Obtain the **Client ID** and **Client Secret** from the Configuration tab.
+/// 4. Set the **Redirect URI** to match the `redirect_uri` you pass to [`BoxOAuth::new`].
+///
+/// # Scopes
+///
+/// Box does not use traditional OAuth scopes. Instead, access is controlled by application
+/// permissions configured in the Developer Console. Common permissions include:
+///
+/// | Permission | Description |
+/// |-------|-------------|
+/// | Read all files and folders | Access to user's Box content |
+/// | Write all files and folders | Create and modify content |
+/// | Manage users | Administer users (enterprise only) |
+///
+/// See the full list at <https://developer.box.com/guides/api-calls/permissions-and-errors/scopes/>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{BoxOAuth, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let box_oauth = BoxOAuth::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = box_oauth.authorization_url(&state, &[]);
+///
+/// // Step 2: Exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = box_oauth
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = box_oauth
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+///
+/// // Step 4 (optional): Revoke a token.
+/// box_oauth.revoke_token(&http, tokens.access_token()?).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct BoxOAuth {
     client_id: String,
     client_secret: String,
@@ -17,6 +75,26 @@ pub struct BoxOAuth {
 }
 
 impl BoxOAuth {
+    /// Creates a new Box OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from the Box Developer Console.
+    /// * `client_secret` - The OAuth 2.0 client secret from the Box Developer Console.
+    /// * `redirect_uri` - The URI Box will redirect to after authorization. Must match
+    ///   the redirect URI configured in your application settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::BoxOAuth;
+    ///
+    /// let box_oauth = BoxOAuth::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -35,6 +113,29 @@ impl BoxOAuth {
 
 #[cfg(any(test, feature = "testing"))]
 impl BoxOAuth {
+    /// Creates a Box client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::BoxOAuth;
+    ///
+    /// let box_oauth = BoxOAuth::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    ///     Some("http://localhost:8080/revoke"),
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -57,10 +158,34 @@ impl BoxOAuth {
 }
 
 impl BoxOAuth {
+    /// Returns the provider name (`"Box"`).
     pub fn name(&self) -> &'static str {
         "Box"
     }
 
+    /// Builds the Box authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application should
+    /// store `state` in the user's session before redirecting to validate the callback.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - Box does not use traditional OAuth scopes. Pass an empty array or specific
+    ///   scopes if required by your application configuration.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{BoxOAuth, generate_state};
+    ///
+    /// let box_oauth = BoxOAuth::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = box_oauth.authorization_url(&state, &[]);
+    /// assert!(url.as_str().starts_with("https://account.box.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url =
             url::Url::parse(&self.authorization_endpoint).expect("invalid authorization endpoint");
@@ -77,6 +202,38 @@ impl BoxOAuth {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Box redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Box rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{BoxOAuth, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let box_oauth = BoxOAuth::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = box_oauth
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -93,6 +250,38 @@ impl BoxOAuth {
         send_token_request(http_client, request).await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Box access tokens typically expire after 60 minutes. If your initial token response
+    /// included a refresh token, you can use it to obtain a new access token without user
+    /// interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{BoxOAuth, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let box_oauth = BoxOAuth::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = box_oauth
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -108,6 +297,32 @@ impl BoxOAuth {
         send_token_request(http_client, request).await
     }
 
+    /// Revokes an access token or refresh token.
+    ///
+    /// Use this when a user signs out or disconnects your application.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `token` - The access token or refresh token to revoke.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedResponse`] if Box returns a non-200 status, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{BoxOAuth, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let box_oauth = BoxOAuth::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// box_oauth.revoke_token(&http, "token-to-revoke").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

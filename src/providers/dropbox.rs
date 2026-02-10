@@ -7,6 +7,64 @@ const AUTHORIZATION_ENDPOINT: &str = "https://www.dropbox.com/oauth2/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.dropboxapi.com/oauth2/token";
 const REVOCATION_ENDPOINT: &str = "https://api.dropboxapi.com/2/auth/token/revoke";
 
+/// OAuth 2.0 client for [Dropbox](https://developers.dropbox.com/oauth-guide).
+///
+/// Dropbox uses standard OAuth 2.0 authorization code flow without PKCE.
+/// The client supports authorization, token exchange, token refresh, and token revocation.
+///
+/// # Setup
+///
+/// 1. Create an app in the [Dropbox App Console](https://www.dropbox.com/developers/apps/create).
+/// 2. Choose your API access level (Full Dropbox or App folder) and obtain the app key (client ID) and app secret (client secret).
+/// 3. Add your redirect URI to the OAuth 2 redirect URIs list in your app settings.
+///
+/// # Scopes
+///
+/// Dropbox uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `account_info.read` | View user's account information |
+/// | `files.metadata.read` | View metadata for files and folders |
+/// | `files.metadata.write` | Create, modify, and delete file metadata |
+/// | `files.content.read` | View content of files |
+/// | `files.content.write` | Create, modify, and delete file content |
+///
+/// See the full list at <https://developers.dropbox.com/oauth-guide#permissions>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Dropbox, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let provider = Dropbox::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = provider.authorization_url(&state, &["account_info.read", "files.content.read"]);
+///
+/// // Step 2: Exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = provider
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = provider
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+///
+/// // Step 4 (optional): Revoke a token.
+/// provider.revoke_token(&http, tokens.access_token()?).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Dropbox {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -15,6 +73,26 @@ pub struct Dropbox {
 }
 
 impl Dropbox {
+    /// Creates a new Dropbox OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID (app key) from Dropbox's App Console.
+    /// * `client_secret` - The OAuth 2.0 client secret (app secret) from Dropbox's App Console.
+    /// * `redirect_uri` - The URI Dropbox will redirect to after authorization.
+    ///   Must match one configured in your app settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Dropbox;
+    ///
+    /// let provider = Dropbox::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -35,6 +113,29 @@ impl Dropbox {
 
 #[cfg(any(test, feature = "testing"))]
 impl Dropbox {
+    /// Creates a Dropbox client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Dropbox;
+    ///
+    /// let provider = Dropbox::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    ///     Some("http://localhost:8080/revoke"),
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -59,15 +160,69 @@ impl Dropbox {
 }
 
 impl Dropbox {
+    /// Returns the provider name (`"Dropbox"`).
     pub fn name(&self) -> &'static str {
         "Dropbox"
     }
 
+    /// Builds the Dropbox authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token. Use [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["account_info.read", "files.content.read"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Dropbox, generate_state};
+    ///
+    /// let provider = Dropbox::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = provider.authorization_url(&state, &["account_info.read", "files.content.read"]);
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         self.client
             .create_authorization_url(&self.authorization_endpoint, state, scopes)
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Dropbox redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Dropbox rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Dropbox, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let provider = Dropbox::new("client-id", "client-secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = provider
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -78,6 +233,37 @@ impl Dropbox {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Dropbox access tokens typically expire after 4 hours. Use this method to
+    /// obtain a new access token without requiring the user to re-authenticate.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Dropbox, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let provider = Dropbox::new("client-id", "client-secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = provider
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -88,6 +274,33 @@ impl Dropbox {
             .await
     }
 
+    /// Revokes an access token or refresh token.
+    ///
+    /// This invalidates the token immediately, preventing further use. Note that
+    /// Dropbox's revocation endpoint only accepts access tokens, not refresh tokens.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `token` - The access token to revoke.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedResponse`] if Dropbox returns a non-200 status, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Dropbox, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let provider = Dropbox::new("client-id", "client-secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// provider.revoke_token(&http, "token-to-revoke").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

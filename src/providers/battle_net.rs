@@ -6,6 +6,58 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://oauth.battle.net/authorize";
 const TOKEN_ENDPOINT: &str = "https://oauth.battle.net/token";
 
+/// OAuth 2.0 client for [Battle.net](https://develop.battle.net/documentation/guides/using-oauth).
+///
+/// Battle.net does not require PKCE. The authorization URL always includes a `scope`
+/// parameter, even when empty, as required by Battle.net's OAuth 2.0 implementation.
+/// This client supports the authorization code flow for accessing Blizzard game APIs.
+///
+/// # Setup
+///
+/// 1. Go to the [Battle.net Developer Portal](https://develop.battle.net/).
+/// 2. Create a new OAuth client.
+/// 3. Configure the redirect URI to match the `redirect_uri` you pass to [`BattleNet::new`].
+/// 4. Note your Client ID and Client Secret.
+///
+/// # Scopes
+///
+/// Battle.net uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `openid` | OpenID Connect authentication |
+/// | `wow.profile` | World of Warcraft profile data |
+/// | `sc2.profile` | StarCraft II profile data |
+/// | `d3.profile` | Diablo III profile data |
+///
+/// See the full list at <https://develop.battle.net/documentation/guides/using-oauth/authorization-code-flow>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{BattleNet, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let battle_net = BattleNet::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let url = battle_net.authorization_url(&state, &["openid", "wow.profile"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = battle_net
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct BattleNet {
     client_id: String,
     client_secret: String,
@@ -15,6 +67,26 @@ pub struct BattleNet {
 }
 
 impl BattleNet {
+    /// Creates a new Battle.net OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from the Battle.net Developer Portal.
+    /// * `client_secret` - The OAuth 2.0 client secret from the Battle.net Developer Portal.
+    /// * `redirect_uri` - The URI Battle.net will redirect to after authorization. Must match
+    ///   the redirect URI configured in your OAuth client.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::BattleNet;
+    ///
+    /// let battle_net = BattleNet::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +104,28 @@ impl BattleNet {
 
 #[cfg(any(test, feature = "testing"))]
 impl BattleNet {
+    /// Creates a Battle.net client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::BattleNet;
+    ///
+    /// let battle_net = BattleNet::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,10 +144,34 @@ impl BattleNet {
 }
 
 impl BattleNet {
+    /// Returns the provider name (`"Battle.net"`).
     pub fn name(&self) -> &'static str {
         "Battle.net"
     }
 
+    /// Builds the Battle.net authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Battle.net-specific: the
+    /// `scope` parameter is always included, even when empty. Your application should store
+    /// `state` in the user's session before redirecting.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["openid", "wow.profile"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{BattleNet, generate_state};
+    ///
+    /// let battle_net = BattleNet::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = battle_net.authorization_url(&state, &["openid", "wow.profile"]);
+    /// assert!(url.as_str().starts_with("https://oauth.battle.net/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -71,6 +189,39 @@ impl BattleNet {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Battle.net redirects back with a `code`
+    /// query parameter. Battle.net-specific: credentials are sent in the POST body (not via
+    /// Basic auth).
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Battle.net rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{BattleNet, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let battle_net = BattleNet::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = battle_net
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

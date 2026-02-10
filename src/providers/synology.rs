@@ -4,6 +4,57 @@ use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
 use crate::tokens::OAuth2Tokens;
 
+/// OAuth 2.0 client for [Synology](https://kb.synology.com/en-global/DSM/help/OAuthService/oauth_service_desc?version=7).
+///
+/// Synology requires PKCE with the S256 challenge method. This client supports
+/// the authorization code flow for authenticating with self-hosted Synology NAS devices.
+///
+/// # Setup
+///
+/// 1. Access your Synology NAS and navigate to **Control Panel > Application Portal > OAuth**.
+/// 2. Click **Create** to register a new OAuth application.
+/// 3. Configure the redirect URI to match the `redirect_uri` you pass to [`Synology::new`].
+/// 4. Note your Application ID and Application Secret.
+///
+/// # Scopes
+///
+/// Synology uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `user.profile` | Access to user profile information |
+/// | `files` | Access to file station |
+///
+/// Refer to your Synology NAS documentation for the complete list of available scopes.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Synology, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let synology = Synology::new(
+///     "https://nas.example.com:5001",
+///     "your-application-id",
+///     "your-application-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = synology.authorization_url(&state, &["user.profile"], &code_verifier);
+/// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = synology
+///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct Synology {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -11,6 +62,28 @@ pub struct Synology {
 }
 
 impl Synology {
+    /// Creates a new Synology OAuth 2.0 client for a self-hosted NAS.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_url` - The base URL of your Synology NAS (e.g., `https://nas.example.com:5001`).
+    /// * `application_id` - The Application ID from your Synology OAuth application.
+    /// * `application_secret` - The Application Secret from your Synology OAuth application.
+    /// * `redirect_uri` - The URI Synology will redirect to after authorization. Must match
+    ///   the redirect URI configured in your OAuth application settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Synology;
+    ///
+    /// let synology = Synology::new(
+    ///     "https://nas.example.com:5001",
+    ///     "your-application-id",
+    ///     "your-application-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         base_url: impl Into<String>,
         application_id: impl Into<String>,
@@ -31,10 +104,42 @@ impl Synology {
 }
 
 impl Synology {
+    /// Returns the provider name (`"Synology"`).
     pub fn name(&self) -> &'static str {
         "Synology"
     }
 
+    /// Builds the Synology authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 and PKCE parameters. Your
+    /// application should store `state` and `code_verifier` in the user's session
+    /// before redirecting, as both are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["user.profile"]`).
+    /// * `code_verifier` - The PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Synology, generate_state, generate_code_verifier};
+    ///
+    /// let synology = Synology::new(
+    ///     "https://nas.example.com:5001",
+    ///     "app-id",
+    ///     "app-secret",
+    ///     "https://example.com/cb"
+    /// );
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = synology.authorization_url(&state, &["user.profile"], &verifier);
+    /// assert!(url.as_str().starts_with("https://nas.example.com:5001/webman/sso/"));
+    /// ```
     pub fn authorization_url(
         &self,
         state: &str,
@@ -50,6 +155,45 @@ impl Synology {
         )
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Synology redirects back with a `code`
+    /// query parameter. The `code_verifier` must be the same value used to generate the
+    /// authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Synology rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Synology, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let synology = Synology::new(
+    ///     "https://nas.example.com:5001",
+    ///     "app-id",
+    ///     "secret",
+    ///     "https://example.com/cb"
+    /// );
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = synology
+    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

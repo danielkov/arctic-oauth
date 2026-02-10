@@ -6,6 +6,55 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://shikimori.one/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://shikimori.one/oauth/token";
 
+/// OAuth 2.0 client for [Shikimori](https://shikimori.one/oauth).
+///
+/// Shikimori does not require PKCE or scopes for authorization requests. This client supports
+/// the standard authorization code flow including token refresh. Credentials are sent in the
+/// request body rather than via HTTP Basic authentication.
+///
+/// # Setup
+///
+/// 1. Register an OAuth application at [Shikimori OAuth Applications](https://shikimori.one/oauth/applications).
+/// 2. Obtain your client ID and client secret from the application page.
+/// 3. Set the redirect URI in your application settings to match the `redirect_uri` you pass to [`Shikimori::new`].
+///
+/// # Scopes
+///
+/// Shikimori does not use OAuth scopes. All authenticated users have the same level of access
+/// based on their account permissions. The [`authorization_url`](Self::authorization_url) method
+/// does not accept a scopes parameter.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Shikimori, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let shikimori = Shikimori::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let url = shikimori.authorization_url(&state);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = shikimori
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = shikimori
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Shikimori {
     client_id: String,
     client_secret: String,
@@ -15,6 +64,26 @@ pub struct Shikimori {
 }
 
 impl Shikimori {
+    /// Creates a new Shikimori OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from Shikimori application page.
+    /// * `client_secret` - The OAuth 2.0 client secret from Shikimori application page.
+    /// * `redirect_uri` - The URI Shikimori will redirect to after authorization. Must match
+    ///   the redirect URI configured in your Shikimori application settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Shikimori;
+    ///
+    /// let shikimori = Shikimori::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +101,28 @@ impl Shikimori {
 
 #[cfg(any(test, feature = "testing"))]
 impl Shikimori {
+    /// Creates a Shikimori client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Shikimori;
+    ///
+    /// let shikimori = Shikimori::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,10 +141,34 @@ impl Shikimori {
 }
 
 impl Shikimori {
+    /// Returns the provider name (`"Shikimori"`).
     pub fn name(&self) -> &'static str {
         "Shikimori"
     }
 
+    /// Builds the Shikimori authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to prevent CSRF attacks. Note that Shikimori does not use scopes, so this method
+    /// does not accept a scopes parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Shikimori, generate_state};
+    ///
+    /// let shikimori = Shikimori::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = shikimori.authorization_url(&state);
+    /// assert!(url.as_str().starts_with("https://shikimori.one/"));
+    /// ```
     pub fn authorization_url(&self, state: &str) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -67,6 +182,38 @@ impl Shikimori {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Shikimori redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Shikimori rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Shikimori, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let shikimori = Shikimori::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = shikimori
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -83,6 +230,38 @@ impl Shikimori {
         send_token_request(http_client, request).await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Shikimori access tokens typically expire after 24 hours. If your initial token response
+    /// included a refresh token, you can use it to obtain a new access token without user
+    /// interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Shikimori, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let shikimori = Shikimori::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = shikimori
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

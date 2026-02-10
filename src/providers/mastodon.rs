@@ -4,6 +4,61 @@ use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
 use crate::tokens::OAuth2Tokens;
 
+/// OAuth 2.0 client for [Mastodon](https://docs.joinmastodon.org/client/token/).
+///
+/// Mastodon requires PKCE with the S256 challenge method on all authorization requests.
+/// This client supports the authorization code flow including token revocation. Note that
+/// Mastodon is a federated platform, so you must specify the instance base URL.
+///
+/// # Setup
+///
+/// 1. Register your application on the target Mastodon instance via the API (`POST /api/v1/apps`) or web interface.
+/// 2. Obtain the **client_id** and **client_secret** from the registration response.
+/// 3. Set the **redirect_uri** to match the value you pass to [`Mastodon::new`].
+///
+/// # Scopes
+///
+/// Mastodon uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `read` | Read access to all data |
+/// | `write` | Write access to all data |
+/// | `follow` | Modify account relationships |
+/// | `push` | Receive push notifications |
+///
+/// See the full list at <https://docs.joinmastodon.org/api/oauth-scopes/>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Mastodon, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let mastodon = Mastodon::new(
+///     "https://mastodon.social",
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = mastodon.authorization_url(&state, &["read", "write"], &code_verifier);
+///
+/// // Step 2: Exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = mastodon
+///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Revoke a token.
+/// mastodon.revoke_token(&http, tokens.access_token()?).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Mastodon {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -12,6 +67,28 @@ pub struct Mastodon {
 }
 
 impl Mastodon {
+    /// Creates a new Mastodon OAuth 2.0 client configured for a specific instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_url` - The base URL of the Mastodon instance (e.g. `"https://mastodon.social"`).
+    /// * `client_id` - The OAuth 2.0 client ID from app registration.
+    /// * `client_secret` - The OAuth 2.0 client secret from app registration.
+    /// * `redirect_uri` - The URI Mastodon will redirect to after authorization. Must match
+    ///   the redirect URI configured during app registration.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Mastodon;
+    ///
+    /// let mastodon = Mastodon::new(
+    ///     "https://mastodon.social",
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         base_url: impl Into<String>,
         client_id: impl Into<String>,
@@ -33,10 +110,37 @@ impl Mastodon {
 }
 
 impl Mastodon {
+    /// Returns the provider name (`"Mastodon"`).
     pub fn name(&self) -> &'static str {
         "Mastodon"
     }
 
+    /// Builds the Mastodon authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 and PKCE parameters. Your
+    /// application should store `state` and `code_verifier` in the user's session
+    /// before redirecting, as both are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["read", "write"]`).
+    /// * `code_verifier` - The PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Mastodon, generate_state, generate_code_verifier};
+    ///
+    /// let mastodon = Mastodon::new("https://mastodon.social", "client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = mastodon.authorization_url(&state, &["read"], &verifier);
+    /// assert!(url.as_str().starts_with("https://mastodon.social/"));
+    /// ```
     pub fn authorization_url(
         &self,
         state: &str,
@@ -52,6 +156,40 @@ impl Mastodon {
         )
     }
 
+    /// Exchanges an authorization code for access tokens.
+    ///
+    /// Call this in your redirect URI handler after Mastodon redirects back with a `code`
+    /// query parameter. The `code_verifier` must be the same value used to generate the
+    /// authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Mastodon rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Mastodon, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let mastodon = Mastodon::new("https://mastodon.social", "client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = mastodon
+    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -68,6 +206,32 @@ impl Mastodon {
             .await
     }
 
+    /// Revokes an access token.
+    ///
+    /// Use this when a user signs out or disconnects your application.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `token` - The access token to revoke.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedResponse`] if Mastodon returns a non-200 status, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Mastodon, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let mastodon = Mastodon::new("https://mastodon.social", "client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// mastodon.revoke_token(&http, "token-to-revoke").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

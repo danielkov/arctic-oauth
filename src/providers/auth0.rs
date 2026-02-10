@@ -4,6 +4,68 @@ use crate::http::HttpClient;
 use crate::pkce::CodeChallengeMethod;
 use crate::tokens::OAuth2Tokens;
 
+/// OAuth 2.0 client for [Auth0](https://auth0.com/docs/get-started/authentication-and-authorization-flow/authorization-code-flow).
+///
+/// Auth0 optionally supports PKCE with the S256 challenge method. This client supports
+/// the full authorization code flow with and without PKCE, including token refresh and
+/// revocation. The client secret is optional for public clients.
+///
+/// # Setup
+///
+/// 1. Create an application in the [Auth0 Dashboard](https://manage.auth0.com/).
+/// 2. Go to **Applications > Applications** and create a new application.
+/// 3. Copy your domain, client ID, and client secret from the application settings.
+/// 4. Add your redirect URI under **Application URIs > Allowed Callback URLs**.
+///
+/// # Scopes
+///
+/// Auth0 uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `openid` | OpenID Connect authentication |
+/// | `profile` | User's profile information |
+/// | `email` | User's email address |
+/// | `offline_access` | Request a refresh token |
+///
+/// See the full list at <https://auth0.com/docs/get-started/apis/scopes>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Auth0, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let auth0 = Auth0::new(
+///     "myapp.us.auth0.com",
+///     "your-client-id",
+///     Some("your-client-secret".into()),
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = auth0.authorization_url(&state, &["openid", "profile"], Some(&code_verifier));
+/// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = auth0
+///     .validate_authorization_code(&http, "authorization-code", Some(&code_verifier))
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = auth0
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+///
+/// // Step 4 (optional): Revoke a token.
+/// auth0.revoke_token(&http, tokens.access_token()?).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Auth0 {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -12,6 +74,30 @@ pub struct Auth0 {
 }
 
 impl Auth0 {
+    /// Creates a new Auth0 OAuth 2.0 client.
+    ///
+    /// The endpoints are automatically constructed from your Auth0 domain.
+    ///
+    /// # Arguments
+    ///
+    /// * `domain` - Your Auth0 tenant domain (e.g., `myapp.us.auth0.com`).
+    /// * `client_id` - The client ID from your Auth0 application.
+    /// * `client_secret` - The client secret (optional for public clients).
+    /// * `redirect_uri` - The URI Auth0 will redirect to after authorization. Must match
+    ///   one of the allowed callback URLs configured in your Auth0 application.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Auth0;
+    ///
+    /// let auth0 = Auth0::new(
+    ///     "myapp.us.auth0.com",
+    ///     "your-client-id",
+    ///     Some("your-client-secret".into()),
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         domain: impl Into<String>,
         client_id: impl Into<String>,
@@ -29,10 +115,42 @@ impl Auth0 {
 }
 
 impl Auth0 {
+    /// Returns the provider name (`"Auth0"`).
     pub fn name(&self) -> &'static str {
         "Auth0"
     }
 
+    /// Builds the Auth0 authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters, and optionally PKCE
+    /// parameters if `code_verifier` is provided. Your application should store `state`
+    /// (and `code_verifier` if using PKCE) in the user's session before redirecting.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["openid", "profile"]`).
+    /// * `code_verifier` - Optional PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one, or pass
+    ///   `None` to skip PKCE.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Auth0, generate_state, generate_code_verifier};
+    ///
+    /// let auth0 = Auth0::new("myapp.us.auth0.com", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// // With PKCE:
+    /// let url = auth0.authorization_url(&state, &["openid", "profile"], Some(&verifier));
+    /// assert!(url.as_str().starts_with("https://"));
+    ///
+    /// // Without PKCE:
+    /// let url_no_pkce = auth0.authorization_url(&state, &["openid", "profile"], None);
+    /// ```
     pub fn authorization_url(
         &self,
         state: &str,
@@ -53,6 +171,47 @@ impl Auth0 {
         }
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Auth0 redirects back with a `code`
+    /// query parameter. If you used PKCE in the authorization URL, you must pass the
+    /// same `code_verifier` here.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - Optional PKCE code verifier stored during the authorization step.
+    ///   Pass `None` if you did not use PKCE.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Auth0 rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Auth0, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let auth0 = Auth0::new("myapp.us.auth0.com", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// // With PKCE:
+    /// let tokens = auth0
+    ///     .validate_authorization_code(&http, "the-auth-code", Some("the-code-verifier"))
+    ///     .await?;
+    ///
+    /// // Without PKCE:
+    /// let tokens_no_pkce = auth0
+    ///     .validate_authorization_code(&http, "the-auth-code", None)
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -64,6 +223,38 @@ impl Auth0 {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Auth0 access tokens expire after a set period. If your initial token response
+    /// included a refresh token (requires the `offline_access` scope), you can use it
+    /// to obtain a new access token without user interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Auth0, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let auth0 = Auth0::new("myapp.us.auth0.com", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = auth0
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -74,6 +265,33 @@ impl Auth0 {
             .await
     }
 
+    /// Revokes an access token or refresh token.
+    ///
+    /// Use this when a user signs out or disconnects your application. Revoking a
+    /// refresh token will invalidate all access tokens issued from it.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `token` - The access token or refresh token to revoke.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedResponse`] if Auth0 returns a non-200 status, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Auth0, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let auth0 = Auth0::new("myapp.us.auth0.com", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// auth0.revoke_token(&http, "token-to-revoke").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

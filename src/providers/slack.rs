@@ -6,6 +6,56 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://slack.com/openid/connect/authorize";
 const TOKEN_ENDPOINT: &str = "https://slack.com/api/openid.connect.token";
 
+/// OAuth 2.0 client for [Slack](https://api.slack.com/authentication/oauth-v2).
+///
+/// Slack's OAuth implementation follows the standard authorization code flow without
+/// requiring PKCE. This client supports token exchange but does not support token
+/// refresh or revocation through the standard OAuth endpoints.
+///
+/// # Setup
+///
+/// 1. Create a new Slack app at the [Slack API portal](https://api.slack.com/apps).
+/// 2. Navigate to **OAuth & Permissions** and note your **Client ID** and **Client Secret**.
+/// 3. Add your redirect URI to the **Redirect URLs** section.
+///
+/// # Scopes
+///
+/// Slack uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `openid` | OpenID Connect authentication |
+/// | `profile` | User's profile information |
+/// | `email` | User's email address |
+///
+/// See the full list at <https://api.slack.com/scopes>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Slack, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let slack = Slack::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     Some("https://example.com/callback".into()),
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = slack.authorization_url(&state, &["openid", "profile", "email"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = slack
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct Slack {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -13,6 +63,26 @@ pub struct Slack {
 }
 
 impl Slack {
+    /// Creates a new Slack OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from Slack's OAuth & Permissions page.
+    /// * `client_secret` - The OAuth 2.0 client secret from Slack's OAuth & Permissions page.
+    /// * `redirect_uri` - Optional redirect URI. If `None`, the redirect URI must be configured
+    ///   in your Slack app and omitted from authorization requests.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Slack;
+    ///
+    /// let slack = Slack::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     Some("https://example.com/callback".into()),
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -28,6 +98,28 @@ impl Slack {
 
 #[cfg(any(test, feature = "testing"))]
 impl Slack {
+    /// Creates a Slack client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Slack;
+    ///
+    /// let slack = Slack::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     Some("http://localhost/callback".into()),
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -44,15 +136,70 @@ impl Slack {
 }
 
 impl Slack {
+    /// Returns the provider name (`"Slack"`).
     pub fn name(&self) -> &'static str {
         "Slack"
     }
 
+    /// Builds the Slack authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application should
+    /// store `state` in the user's session before redirecting.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["openid", "profile"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Slack, generate_state};
+    ///
+    /// let slack = Slack::new("client-id", "client-secret", Some("https://example.com/cb".into()));
+    /// let state = generate_state();
+    ///
+    /// let url = slack.authorization_url(&state, &["openid", "profile", "email"]);
+    /// assert!(url.as_str().starts_with("https://slack.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         self.client
             .create_authorization_url(&self.authorization_endpoint, state, scopes)
     }
 
+    /// Exchanges an authorization code for access tokens.
+    ///
+    /// Call this in your redirect URI handler after Slack redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Slack rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Slack, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let slack = Slack::new("client-id", "secret", Some("https://example.com/cb".into()));
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = slack
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

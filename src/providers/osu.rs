@@ -6,6 +6,62 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://osu.ppy.sh/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://osu.ppy.sh/oauth/token";
 
+/// OAuth 2.0 client for [osu!](https://osu.ppy.sh/docs/index.html#authentication).
+///
+/// osu! does not require PKCE for authorization requests. This client supports the standard
+/// authorization code flow including token refresh. The redirect URI is optional for osu!
+/// and credentials are sent in the request body rather than via HTTP Basic authentication.
+///
+/// # Setup
+///
+/// 1. Register an OAuth application at [osu! Account Settings](https://osu.ppy.sh/home/account/edit#oauth).
+/// 2. Obtain your client ID and client secret from the application details.
+/// 3. If using a redirect URI, set the Application Callback URL to match the `redirect_uri` you pass to [`Osu::new`].
+///
+/// # Scopes
+///
+/// osu! uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `identify` | Read user's public profile |
+/// | `public` | Access public data (default) |
+/// | `friends.read` | Read user's friends list |
+/// | `forum.write` | Post to forums on behalf of user |
+///
+/// See the full list at <https://osu.ppy.sh/docs/index.html#scopes>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Osu, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let osu = Osu::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     Some("https://example.com/callback".into()),
+/// );
+///
+/// // Step 1: Generate CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let url = osu.authorization_url(&state, &["identify", "public"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = osu
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = osu
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Osu {
     client_id: String,
     client_secret: String,
@@ -15,6 +71,26 @@ pub struct Osu {
 }
 
 impl Osu {
+    /// Creates a new osu! OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from osu! Account Settings.
+    /// * `client_secret` - The OAuth 2.0 client secret from osu! Account Settings.
+    /// * `redirect_uri` - Optional redirect URI. If provided, must match the Application
+    ///   Callback URL configured in your osu! application. Pass `None` if not using a redirect URI.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Osu;
+    ///
+    /// let osu = Osu::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     Some("https://example.com/callback".into()),
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +108,28 @@ impl Osu {
 
 #[cfg(any(test, feature = "testing"))]
 impl Osu {
+    /// Creates an osu! client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Osu;
+    ///
+    /// let osu = Osu::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     Some("http://localhost/callback".into()),
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,10 +148,35 @@ impl Osu {
 }
 
 impl Osu {
+    /// Returns the provider name (`"osu!"`).
     pub fn name(&self) -> &'static str {
         "osu!"
     }
 
+    /// Builds the osu! authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to prevent CSRF attacks. The redirect URI is included only if it was provided
+    /// to [`Osu::new`].
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["identify", "public"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Osu, generate_state};
+    ///
+    /// let osu = Osu::new("client-id", "client-secret", Some("https://example.com/cb".into()));
+    /// let state = generate_state();
+    ///
+    /// let url = osu.authorization_url(&state, &["identify"]);
+    /// assert!(url.as_str().starts_with("https://osu.ppy.sh/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -72,6 +195,38 @@ impl Osu {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after osu! redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if osu! rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Osu, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let osu = Osu::new("client-id", "secret", Some("https://example.com/cb".into()));
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = osu
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -90,6 +245,38 @@ impl Osu {
         send_token_request(http_client, request).await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// osu! access tokens typically expire after 24 hours. If your initial token response
+    /// included a refresh token, you can use it to obtain a new access token without user
+    /// interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Osu, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let osu = Osu::new("client-id", "secret", Some("https://example.com/cb".into()));
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = osu
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

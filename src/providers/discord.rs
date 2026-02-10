@@ -8,6 +8,68 @@ const AUTHORIZATION_ENDPOINT: &str = "https://discord.com/oauth2/authorize";
 const TOKEN_ENDPOINT: &str = "https://discord.com/api/oauth2/token";
 const REVOCATION_ENDPOINT: &str = "https://discord.com/api/oauth2/token/revoke";
 
+/// OAuth 2.0 client for [Discord](https://discord.com/developers/docs/topics/oauth2).
+///
+/// Discord supports optional PKCE with the S256 challenge method for enhanced security.
+/// This client supports the full authorization code flow including token refresh and
+/// revocation. The client can be configured as either a confidential client (with
+/// client secret) or a public client (without client secret).
+///
+/// # Setup
+///
+/// 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
+/// 2. Navigate to **OAuth2** section and copy your **Client ID** and **Client Secret**.
+/// 3. Add a redirect URI in the **OAuth2 > Redirects** section that matches the `redirect_uri` you pass to [`Discord::new`].
+///
+/// # Scopes
+///
+/// Discord uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `identify` | Read user's basic account info |
+/// | `email` | Read user's email address |
+/// | `guilds` | Read user's guilds (servers) |
+/// | `guilds.join` | Join guilds on behalf of the user |
+/// | `connections` | Read user's connected accounts |
+///
+/// See the full list at <https://discord.com/developers/docs/topics/oauth2#shared-resources-oauth2-scopes>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Discord, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let discord = Discord::new(
+///     "your-client-id",
+///     Some("your-client-secret".to_string()),
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier (optional) and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = discord.authorization_url(&state, &["identify", "email"], Some(&code_verifier))?;
+/// // Store `state` and optionally `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = discord
+///     .validate_authorization_code(&http, "authorization-code", Some(&code_verifier))
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = discord
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+///
+/// // Step 4 (optional): Revoke a token.
+/// discord.revoke_token(&http, tokens.access_token()?).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Discord {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -16,6 +78,35 @@ pub struct Discord {
 }
 
 impl Discord {
+    /// Creates a new Discord OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from Discord's developer portal.
+    /// * `client_secret` - The OAuth 2.0 client secret from Discord's developer portal.
+    ///   Pass `None` to create a public client (for mobile/desktop apps).
+    /// * `redirect_uri` - The URI Discord will redirect to after authorization.
+    ///   Must match one configured in your app settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Discord;
+    ///
+    /// // Confidential client (web apps)
+    /// let discord = Discord::new(
+    ///     "your-client-id",
+    ///     Some("your-client-secret".to_string()),
+    ///     "https://example.com/callback",
+    /// );
+    ///
+    /// // Public client (mobile/desktop apps)
+    /// let discord_public = Discord::new(
+    ///     "your-client-id",
+    ///     None,
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: Option<String>,
@@ -32,6 +123,29 @@ impl Discord {
 
 #[cfg(any(test, feature = "testing"))]
 impl Discord {
+    /// Creates a Discord client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Discord;
+    ///
+    /// let discord = Discord::with_endpoints(
+    ///     "test-client-id",
+    ///     Some("test-secret".to_string()),
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    ///     Some("http://localhost:8080/revoke"),
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: Option<String>,
@@ -52,10 +166,44 @@ impl Discord {
 }
 
 impl Discord {
+    /// Returns the provider name (`"Discord"`).
     pub fn name(&self) -> &'static str {
         "Discord"
     }
 
+    /// Builds the Discord authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters and optionally PKCE
+    /// parameters. Your application should store `state` (and `code_verifier` if PKCE is
+    /// used) in the user's session before redirecting, as they are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["identify", "email"]`).
+    /// * `code_verifier` - Optional PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///   Pass `None` to skip PKCE.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Discord, generate_state, generate_code_verifier};
+    ///
+    /// # fn example() -> Result<(), arctic_oauth::Error> {
+    /// let discord = Discord::new("client-id", Some("secret".to_string()), "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// // With PKCE
+    /// let url = discord.authorization_url(&state, &["identify", "email"], Some(&verifier))?;
+    ///
+    /// // Without PKCE
+    /// let url_no_pkce = discord.authorization_url(&state, &["identify"], None)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn authorization_url(
         &self,
         state: &str,
@@ -78,6 +226,41 @@ impl Discord {
         }
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Discord redirects back with a `code`
+    /// query parameter. If PKCE was used, the `code_verifier` must be the same value used
+    /// to generate the authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///   Pass `None` if PKCE was not used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Discord rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Discord, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let discord = Discord::new("client-id", Some("secret".to_string()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = discord
+    ///     .validate_authorization_code(&http, "the-auth-code", Some("the-code-verifier"))
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -89,6 +272,38 @@ impl Discord {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Discord access tokens typically expire after 7 days. If your initial token response
+    /// included a refresh token, you can use it to obtain a new access token without user
+    /// interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Discord, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let discord = Discord::new("client-id", Some("secret".to_string()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = discord
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -99,6 +314,32 @@ impl Discord {
             .await
     }
 
+    /// Revokes an access token or refresh token.
+    ///
+    /// Use this when a user signs out or disconnects your application from their Discord account.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `token` - The access token or refresh token to revoke.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedResponse`] if Discord returns a non-200 status, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Discord, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let discord = Discord::new("client-id", Some("secret".to_string()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// discord.revoke_token(&http, "token-to-revoke").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

@@ -7,6 +7,61 @@ const AUTHORIZATION_ENDPOINT: &str = "https://start.gg/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.start.gg/oauth/access_token";
 const REFRESH_ENDPOINT: &str = "https://api.start.gg/oauth/refresh";
 
+/// OAuth 2.0 client for [Start.gg](https://developer.start.gg/docs/authentication).
+///
+/// Start.gg uses standard OAuth 2.0 without PKCE. This client supports the authorization
+/// code flow including token refresh. Note that Start.gg uses a separate endpoint for
+/// token refresh requests.
+///
+/// # Setup
+///
+/// 1. Create a developer application at the [Start.gg Developer Portal](https://developer.start.gg/).
+/// 2. Obtain your Client ID and Client Secret from the application settings.
+/// 3. Configure the redirect URI to match the `redirect_uri` you pass to [`StartGG::new`].
+///
+/// # Scopes
+///
+/// Start.gg uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `user.identity` | Read user profile information |
+/// | `user.email` | Access user email address |
+/// | `tournament.read` | Read tournament data |
+///
+/// See the full list at <https://developer.start.gg/docs/authentication/scopes>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{StartGG, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let start_gg = StartGG::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let url = start_gg.authorization_url(&state, &["user.identity"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = start_gg
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = start_gg
+///     .refresh_access_token(&http, tokens.refresh_token()?, &[])
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct StartGG {
     client_id: String,
     client_secret: String,
@@ -17,6 +72,26 @@ pub struct StartGG {
 }
 
 impl StartGG {
+    /// Creates a new Start.gg OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from Start.gg developer settings.
+    /// * `client_secret` - The OAuth 2.0 client secret from Start.gg developer settings.
+    /// * `redirect_uri` - The URI Start.gg will redirect to after authorization. Must match
+    ///   the redirect URI configured in your Start.gg application.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::StartGG;
+    ///
+    /// let start_gg = StartGG::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -35,6 +110,29 @@ impl StartGG {
 
 #[cfg(any(test, feature = "testing"))]
 impl StartGG {
+    /// Creates a Start.gg client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::StartGG;
+    ///
+    /// let start_gg = StartGG::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    ///     "http://localhost:8080/refresh",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -55,10 +153,34 @@ impl StartGG {
 }
 
 impl StartGG {
+    /// Returns the provider name (`"Start.gg"`).
     pub fn name(&self) -> &'static str {
         "Start.gg"
     }
 
+    /// Builds the Start.gg authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application should
+    /// store `state` in the user's session before redirecting. If no scopes are provided,
+    /// the scope parameter is omitted from the URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["user.identity"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{StartGG, generate_state};
+    ///
+    /// let start_gg = StartGG::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = start_gg.authorization_url(&state, &["user.identity"]);
+    /// assert!(url.as_str().starts_with("https://start.gg/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url =
             url::Url::parse(&self.authorization_endpoint).expect("invalid authorization endpoint");
@@ -75,6 +197,38 @@ impl StartGG {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Start.gg redirects back with a `code`
+    /// query parameter. Credentials are sent in the POST body (not via Basic auth).
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Start.gg rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{StartGG, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let start_gg = StartGG::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = start_gg
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -91,6 +245,38 @@ impl StartGG {
         send_token_request(http_client, request).await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Start.gg uses a separate endpoint for token refresh requests. Scopes can optionally
+    /// be included; if empty, the scope parameter is omitted from the request.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    /// * `scopes` - The OAuth 2.0 scopes to request in the refreshed token (optional).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{StartGG, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let start_gg = StartGG::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = start_gg
+    ///     .refresh_access_token(&http, "stored-refresh-token", &[])
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

@@ -9,6 +9,67 @@ const AUTHORIZATION_ENDPOINT: &str =
 const TOKEN_ENDPOINT: &str = "https://developer.api.autodesk.com/authentication/v2/token";
 const REVOCATION_ENDPOINT: &str = "https://developer.api.autodesk.com/authentication/v2/revoke";
 
+/// OAuth 2.0 client for [Autodesk Platform Services](https://aps.autodesk.com/en/docs/oauth/v2/developers_guide/overview/).
+///
+/// Autodesk requires PKCE with the S256 challenge method on all authorization requests.
+/// This client supports both public clients (without client secret) and confidential
+/// clients (with client secret), as well as the full authorization code flow including
+/// token refresh and revocation.
+///
+/// # Setup
+///
+/// 1. Create an application in the [Autodesk Platform Services Console](https://aps.autodesk.com/myapps).
+/// 2. Obtain your client ID and optionally client secret from the application settings.
+/// 3. Set the callback URL to match the `redirect_uri` you pass to [`Autodesk::new`].
+///
+/// # Scopes
+///
+/// Autodesk uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `data:read` | Read user data and files |
+/// | `data:write` | Create and modify files |
+/// | `bucket:read` | Read bucket contents |
+/// | `account:read` | Read account information |
+///
+/// See the full list at <https://aps.autodesk.com/en/docs/oauth/v2/developers_guide/scopes/>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Autodesk, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let autodesk = Autodesk::new(
+///     "your-client-id",
+///     Some("your-client-secret".into()),  // Pass None for public clients
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = autodesk.authorization_url(&state, &["data:read", "data:write"], &code_verifier);
+/// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = autodesk
+///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = autodesk
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+///
+/// // Step 4 (optional): Revoke a token.
+/// autodesk.revoke_token(&http, tokens.access_token()?).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Autodesk {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -17,6 +78,35 @@ pub struct Autodesk {
 }
 
 impl Autodesk {
+    /// Creates a new Autodesk OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from the Autodesk Platform Services Console.
+    /// * `client_secret` - The OAuth 2.0 client secret (pass `Some("secret")` for confidential
+    ///   clients or `None` for public clients).
+    /// * `redirect_uri` - The URI Autodesk will redirect to after authorization. Must match
+    ///   the callback URL configured in your application settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Autodesk;
+    ///
+    /// // Confidential client with secret
+    /// let autodesk = Autodesk::new(
+    ///     "your-client-id",
+    ///     Some("your-client-secret".into()),
+    ///     "https://example.com/callback",
+    /// );
+    ///
+    /// // Public client without secret
+    /// let autodesk_public = Autodesk::new(
+    ///     "your-client-id",
+    ///     None,
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: Option<String>,
@@ -32,10 +122,37 @@ impl Autodesk {
 }
 
 impl Autodesk {
+    /// Returns the provider name (`"Autodesk"`).
     pub fn name(&self) -> &'static str {
         "Autodesk"
     }
 
+    /// Builds the Autodesk authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 and PKCE parameters. Your
+    /// application should store `state` and `code_verifier` in the user's session
+    /// before redirecting, as both are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["data:read", "data:write"]`).
+    /// * `code_verifier` - The PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Autodesk, generate_state, generate_code_verifier};
+    ///
+    /// let autodesk = Autodesk::new("client-id", None, "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = autodesk.authorization_url(&state, &["data:read"], &verifier);
+    /// assert!(url.as_str().starts_with("https://developer.api.autodesk.com/"));
+    /// ```
     pub fn authorization_url(
         &self,
         state: &str,
@@ -51,6 +168,40 @@ impl Autodesk {
         )
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Autodesk redirects back with a `code`
+    /// query parameter. The `code_verifier` must be the same value used to generate the
+    /// authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Autodesk rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Autodesk, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let autodesk = Autodesk::new("client-id", None, "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = autodesk
+    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -67,6 +218,38 @@ impl Autodesk {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Autodesk access tokens typically expire after 1 hour. If your initial token
+    /// response included a refresh token, you can use it to obtain a new access token
+    /// without user interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Autodesk, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let autodesk = Autodesk::new("client-id", None, "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = autodesk
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -77,6 +260,33 @@ impl Autodesk {
             .await
     }
 
+    /// Revokes an access token or refresh token.
+    ///
+    /// Use this when a user signs out or disconnects your application. Revoking a
+    /// token immediately invalidates it with Autodesk.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `token` - The access token or refresh token to revoke.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedResponse`] if Autodesk returns a non-200 status, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Autodesk, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let autodesk = Autodesk::new("client-id", None, "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// autodesk.revoke_token(&http, "token-to-revoke").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

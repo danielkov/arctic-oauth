@@ -6,6 +6,59 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://account.withings.com/oauth2_user/authorize2";
 const TOKEN_ENDPOINT: &str = "https://wbsapi.withings.net/v2/oauth2";
 
+/// OAuth 2.0 client for [Withings](https://developer.withings.com/).
+///
+/// Withings uses a non-standard token response format where successful responses are
+/// wrapped in `{"status": 0, "body": {...}}`. Errors can also be returned with HTTP 200
+/// status, indicated by a non-zero status field. This client handles these quirks automatically
+/// and supports the authorization code flow. Withings does not require PKCE.
+///
+/// # Setup
+///
+/// 1. Create a Withings developer account at <https://developer.withings.com/>.
+/// 2. Create a new application in the [Withings Developer Dashboard](https://account.withings.com/partner/dashboard_oauth2).
+/// 3. Note your **Client ID** and **Client Secret**.
+/// 4. Configure the **Callback URI** to match the `redirect_uri` you pass to [`Withings::new`].
+/// 5. Request access to the required scopes for your application.
+///
+/// # Scopes
+///
+/// Withings uses comma-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `user.info` | User's basic profile information |
+/// | `user.metrics` | User's weight, height, and body measurements |
+/// | `user.activity` | User's activity and workout data |
+///
+/// See the full list at <https://developer.withings.com/api-reference#section/Authentication/Scopes>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Withings, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let withings = Withings::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = withings.authorization_url(&state, &["user.info", "user.metrics"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = withings
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct Withings {
     client_id: String,
     client_secret: String,
@@ -15,6 +68,26 @@ pub struct Withings {
 }
 
 impl Withings {
+    /// Creates a new Withings OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The Client ID from Withings Developer Dashboard.
+    /// * `client_secret` - The Client Secret from Withings Developer Dashboard.
+    /// * `redirect_uri` - The URI Withings will redirect to after authorization. Must match
+    ///   one of the callback URIs configured in your Withings application settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Withings;
+    ///
+    /// let withings = Withings::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +105,28 @@ impl Withings {
 
 #[cfg(any(test, feature = "testing"))]
 impl Withings {
+    /// Creates a Withings client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Withings;
+    ///
+    /// let withings = Withings::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,10 +145,35 @@ impl Withings {
 }
 
 impl Withings {
+    /// Returns the provider name (`"Withings"`).
     pub fn name(&self) -> &'static str {
         "Withings"
     }
 
+    /// Builds the Withings authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Withings uses
+    /// comma-separated scopes and does not require PKCE. Your application should
+    /// store `state` in the user's session before redirecting, as it is needed to
+    /// validate the callback.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["user.info", "user.metrics"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Withings, generate_state};
+    ///
+    /// let withings = Withings::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = withings.authorization_url(&state, &["user.info", "user.metrics"]);
+    /// assert!(url.as_str().starts_with("https://account.withings.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -71,6 +191,41 @@ impl Withings {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Withings redirects back with a `code`
+    /// query parameter. This method handles Withings' non-standard response format by
+    /// unwrapping the token data from the nested `body` field and checking the `status`
+    /// field for errors.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Withings rejects the code,
+    /// [`Error::UnexpectedErrorBody`] if the response status is non-zero, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Withings, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let withings = Withings::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = withings
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

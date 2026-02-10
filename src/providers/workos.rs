@@ -7,6 +7,56 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://api.workos.com/sso/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.workos.com/sso/token";
 
+/// OAuth 2.0 client for [WorkOS](https://workos.com/docs/reference/sso).
+///
+/// WorkOS supports optional PKCE with the S256 challenge method. The client secret is
+/// also optional, allowing for public clients using PKCE. This client supports the
+/// authorization code flow but not token refresh or revocation.
+///
+/// # Setup
+///
+/// 1. Create an account and configure SSO at the [WorkOS Dashboard](https://dashboard.workos.com/).
+/// 2. Obtain your Client ID from the Configuration section.
+/// 3. Optionally obtain a Client Secret for confidential clients.
+/// 4. Configure the redirect URI to match the `redirect_uri` you pass to [`WorkOS::new`].
+///
+/// # Scopes
+///
+/// WorkOS does not use scopes in the traditional OAuth sense. Instead, authentication
+/// is configured through SSO connections and organizations in the WorkOS Dashboard.
+/// The authorization flow automatically grants access based on the organization's
+/// configuration.
+///
+/// See the documentation at <https://workos.com/docs/reference/sso>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{WorkOS, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// // Public client with PKCE
+/// let workos = WorkOS::new(
+///     "your-client-id",
+///     None,
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = workos.authorization_url(&state, Some(&code_verifier));
+/// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = workos
+///     .validate_authorization_code(&http, "authorization-code", Some(&code_verifier))
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct WorkOS {
     client_id: String,
     client_secret: Option<String>,
@@ -16,6 +66,35 @@ pub struct WorkOS {
 }
 
 impl WorkOS {
+    /// Creates a new WorkOS OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from WorkOS Dashboard.
+    /// * `client_secret` - The OAuth 2.0 client secret (optional). Use `None` for public
+    ///   clients using PKCE, or `Some(secret)` for confidential clients.
+    /// * `redirect_uri` - The URI WorkOS will redirect to after authorization. Must match
+    ///   the redirect URI configured in your WorkOS application.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::WorkOS;
+    ///
+    /// // Public client
+    /// let workos = WorkOS::new(
+    ///     "your-client-id",
+    ///     None,
+    ///     "https://example.com/callback",
+    /// );
+    ///
+    /// // Confidential client
+    /// let workos = WorkOS::new(
+    ///     "your-client-id",
+    ///     Some("your-client-secret".to_string()),
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: Option<String>,
@@ -33,6 +112,28 @@ impl WorkOS {
 
 #[cfg(any(test, feature = "testing"))]
 impl WorkOS {
+    /// Creates a WorkOS client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::WorkOS;
+    ///
+    /// let workos = WorkOS::with_endpoints(
+    ///     "test-client-id",
+    ///     Some("test-secret".to_string()),
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: Option<String>,
@@ -51,10 +152,38 @@ impl WorkOS {
 }
 
 impl WorkOS {
+    /// Returns the provider name (`"WorkOS"`).
     pub fn name(&self) -> &'static str {
         "WorkOS"
     }
 
+    /// Builds the WorkOS authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. If a code verifier is
+    /// provided, PKCE parameters with S256 challenge method are included. Your application
+    /// should store `state` and `code_verifier` (if used) in the user's session before
+    /// redirecting.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `code_verifier` - Optional PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one for
+    ///   public clients.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{WorkOS, generate_state, generate_code_verifier};
+    ///
+    /// let workos = WorkOS::new("client-id", None, "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = workos.authorization_url(&state, Some(&verifier));
+    /// assert!(url.as_str().starts_with("https://api.workos.com/"));
+    /// ```
     pub fn authorization_url(
         &self,
         state: &str,
@@ -77,6 +206,40 @@ impl WorkOS {
         url
     }
 
+    /// Exchanges an authorization code for access tokens.
+    ///
+    /// Call this in your redirect URI handler after WorkOS redirects back with a `code`
+    /// query parameter. The `code_verifier` must be provided if PKCE was used during
+    /// authorization. Credentials are sent in the POST body (not via Basic auth).
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier if it was used during authorization.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if WorkOS rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{WorkOS, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let workos = WorkOS::new("client-id", None, "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = workos
+    ///     .validate_authorization_code(&http, "the-auth-code", Some("the-code-verifier"))
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

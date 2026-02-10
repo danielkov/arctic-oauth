@@ -6,6 +6,55 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://api.intra.42.fr/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.intra.42.fr/oauth/token";
 
+/// OAuth 2.0 client for [42 (École 42)](https://api.intra.42.fr/apidoc).
+///
+/// 42 uses the standard authorization code flow without requiring PKCE.
+/// This client supports token exchange using client credentials sent in the request body.
+///
+/// # Setup
+///
+/// 1. Register your application at the [42 API applications page](https://profile.intra.42.fr/oauth/applications).
+/// 2. Note your client ID and client secret from the application settings.
+/// 3. Set the redirect URI to match the `redirect_uri` you pass to [`FortyTwo::new`].
+///
+/// # Scopes
+///
+/// 42 uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `public` | Read public profile information |
+/// | `projects` | Access project information |
+/// | `profile` | Read detailed user profile |
+///
+/// See the full list at <https://api.intra.42.fr/apidoc/guides/getting_started>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{FortyTwo, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let forty_two = FortyTwo::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = forty_two.authorization_url(&state, &["public", "projects"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = forty_two
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct FortyTwo {
     client_id: String,
     client_secret: String,
@@ -15,6 +64,26 @@ pub struct FortyTwo {
 }
 
 impl FortyTwo {
+    /// Creates a new 42 OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from your 42 application settings.
+    /// * `client_secret` - The OAuth 2.0 client secret from your 42 application settings.
+    /// * `redirect_uri` - The URI 42 will redirect to after authorization. Must match
+    ///   one of the redirect URIs configured in your 42 application.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::FortyTwo;
+    ///
+    /// let forty_two = FortyTwo::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +101,28 @@ impl FortyTwo {
 
 #[cfg(any(test, feature = "testing"))]
 impl FortyTwo {
+    /// Creates a 42 client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::FortyTwo;
+    ///
+    /// let forty_two = FortyTwo::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,10 +141,34 @@ impl FortyTwo {
 }
 
 impl FortyTwo {
+    /// Returns the provider name (`"42"`).
     pub fn name(&self) -> &'static str {
         "42"
     }
 
+    /// Builds the 42 authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to prevent CSRF attacks.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["public", "projects"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{FortyTwo, generate_state};
+    ///
+    /// let forty_two = FortyTwo::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = forty_two.authorization_url(&state, &["public", "projects"]);
+    /// assert!(url.as_str().starts_with("https://api.intra.42.fr/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -74,6 +189,38 @@ impl FortyTwo {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after 42 redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if 42 rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{FortyTwo, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let forty_two = FortyTwo::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = forty_two
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

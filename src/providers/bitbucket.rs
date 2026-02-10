@@ -6,6 +6,65 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://bitbucket.org/site/oauth2/authorize";
 const TOKEN_ENDPOINT: &str = "https://bitbucket.org/site/oauth2/access_token";
 
+/// OAuth 2.0 client for [Bitbucket](https://developer.atlassian.com/cloud/bitbucket/oauth-2/).
+///
+/// Bitbucket does not require PKCE and does not use OAuth scopes in the authorization
+/// URL. This client supports the authorization code flow including token refresh. Note
+/// that Bitbucket does not provide a token revocation endpoint.
+///
+/// # Setup
+///
+/// 1. Navigate to a workspace's settings on [Bitbucket](https://bitbucket.org/).
+/// 2. Go to **OAuth consumers** under **Access Management** and click **Add consumer**.
+/// 3. Copy your Client ID (Key) and Client Secret (Secret).
+/// 4. Add the callback URL to match the `redirect_uri` you pass to [`Bitbucket::new`].
+/// 5. Select the necessary permissions for your application.
+///
+/// # Scopes
+///
+/// Bitbucket uses granular permission scopes, but they are configured during app creation
+/// in the Bitbucket settings rather than passed in the authorization URL. Common permissions
+/// include:
+///
+/// | Permission | Description |
+/// |------------|-------------|
+/// | Account: Read | Read user account information |
+/// | Repositories: Read | Access repository metadata and content |
+/// | Pull requests: Read | View pull requests |
+///
+/// See the full list at <https://developer.atlassian.com/cloud/bitbucket/oauth-2/#scopes>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Bitbucket, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let bitbucket = Bitbucket::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = bitbucket.authorization_url(&state);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: Exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = bitbucket
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = bitbucket
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Bitbucket {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -13,6 +72,26 @@ pub struct Bitbucket {
 }
 
 impl Bitbucket {
+    /// Creates a new Bitbucket OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID (Key) from Bitbucket's OAuth consumer settings.
+    /// * `client_secret` - The OAuth 2.0 client secret (Secret) from Bitbucket's OAuth consumer settings.
+    /// * `redirect_uri` - The URI Bitbucket will redirect to after authorization.
+    ///   Must match the callback URL configured in your OAuth consumer.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Bitbucket;
+    ///
+    /// let bitbucket = Bitbucket::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +111,28 @@ impl Bitbucket {
 
 #[cfg(any(test, feature = "testing"))]
 impl Bitbucket {
+    /// Creates a Bitbucket client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Bitbucket;
+    ///
+    /// let bitbucket = Bitbucket::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -52,15 +153,72 @@ impl Bitbucket {
 }
 
 impl Bitbucket {
+    /// Returns the provider name (`"Bitbucket"`).
     pub fn name(&self) -> &'static str {
         "Bitbucket"
     }
 
+    /// Builds the Bitbucket authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to prevent CSRF attacks.
+    ///
+    /// Note: Bitbucket permissions are configured during OAuth consumer creation and
+    /// are not passed as scopes in the authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token. Use [`generate_state`](crate::generate_state) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Bitbucket, generate_state};
+    ///
+    /// let bitbucket = Bitbucket::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = bitbucket.authorization_url(&state);
+    /// assert!(url.as_str().starts_with("https://bitbucket.org/"));
+    /// ```
     pub fn authorization_url(&self, state: &str) -> url::Url {
         self.client
             .create_authorization_url(&self.authorization_endpoint, state, &[])
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Bitbucket redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Bitbucket rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Bitbucket, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let bitbucket = Bitbucket::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = bitbucket
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -71,6 +229,37 @@ impl Bitbucket {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Bitbucket access tokens typically expire after 2 hours. Use this method to
+    /// obtain a new access token without requiring the user to re-authenticate.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Bitbucket, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let bitbucket = Bitbucket::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = bitbucket
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

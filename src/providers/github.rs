@@ -6,6 +6,59 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://github.com/login/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://github.com/login/oauth/access_token";
 
+/// OAuth 2.0 client for [GitHub](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps).
+///
+/// GitHub does not require or support PKCE for OAuth Apps. This client supports the authorization
+/// code flow for token exchange. Note that GitHub has a unique behavior where OAuth errors can be
+/// returned with HTTP 200 status code, which this client handles correctly.
+///
+/// # Setup
+///
+/// 1. Go to **Settings > Developer settings > OAuth Apps** in your GitHub account or organization.
+/// 2. Click **New OAuth App** and fill in the application details.
+/// 3. Set the **Authorization callback URL** to match the `redirect_uri` you pass to [`GitHub::new`].
+/// 4. Note your **Client ID** and generate a **Client Secret**.
+///
+/// # Scopes
+///
+/// GitHub uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `repo` | Full control of private repositories |
+/// | `user` | Read/write access to profile info |
+/// | `read:user` | Read access to profile info |
+/// | `user:email` | Access to user email addresses |
+/// | `gist` | Write access to gists |
+///
+/// See the full list at <https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/scopes-for-oauth-apps>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{GitHub, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let github = GitHub::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     Some("https://example.com/callback".to_string()),
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = github.authorization_url(&state, &["repo", "user"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = github
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct GitHub {
     client_id: String,
     client_secret: String,
@@ -15,6 +68,27 @@ pub struct GitHub {
 }
 
 impl GitHub {
+    /// Creates a new GitHub OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from GitHub's OAuth App settings.
+    /// * `client_secret` - The OAuth 2.0 client secret from GitHub's OAuth App settings.
+    /// * `redirect_uri` - The URI GitHub will redirect to after authorization. Must match
+    ///   the callback URL configured in your GitHub OAuth App. Pass `None` to omit the
+    ///   redirect URI from requests (GitHub will use the default configured in the app).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::GitHub;
+    ///
+    /// let github = GitHub::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     Some("https://example.com/callback".to_string()),
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +106,28 @@ impl GitHub {
 
 #[cfg(any(test, feature = "testing"))]
 impl GitHub {
+    /// Creates a GitHub client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::GitHub;
+    ///
+    /// let github = GitHub::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     Some("http://localhost/callback".to_string()),
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,10 +146,34 @@ impl GitHub {
 }
 
 impl GitHub {
+    /// Returns the provider name (`"GitHub"`).
     pub fn name(&self) -> &'static str {
         "GitHub"
     }
 
+    /// Builds the GitHub authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application should
+    /// store `state` in the user's session before redirecting, as it is needed to validate
+    /// the callback and prevent CSRF attacks.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["repo", "user"]`).
+    ///   Pass an empty slice `&[]` for no specific scopes.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{GitHub, generate_state};
+    ///
+    /// let github = GitHub::new("client-id", "client-secret", Some("https://example.com/cb".to_string()));
+    /// let state = generate_state();
+    ///
+    /// let url = github.authorization_url(&state, &["repo", "user"]);
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -76,6 +196,39 @@ impl GitHub {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after GitHub redirects back with a `code`
+    /// query parameter. Note that GitHub has a unique behavior where OAuth errors can be
+    /// returned with HTTP 200 status code; this method handles that correctly.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if GitHub rejects the code (including errors returned
+    /// with HTTP 200), or [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{GitHub, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let github = GitHub::new("client-id", "secret", Some("https://example.com/cb".to_string()));
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = github
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

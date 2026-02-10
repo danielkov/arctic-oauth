@@ -7,6 +7,60 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://access.line.me/oauth2/v2.1/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.line.me/oauth2/v2.1/token";
 
+/// OAuth 2.0 client for [LINE](https://developers.line.biz/en/docs/line-login/integrate-line-login/).
+///
+/// LINE requires PKCE with the S256 challenge method on all authorization requests.
+/// This client supports the authorization code flow including token refresh.
+///
+/// # Setup
+///
+/// 1. Create a provider in the [LINE Developers Console](https://developers.line.biz/console/).
+/// 2. Create a channel for LINE Login and obtain the **Channel ID** (client ID) and **Channel Secret**.
+/// 3. Set the **Callback URL** to match the `redirect_uri` you pass to [`Line::new`].
+///
+/// # Scopes
+///
+/// LINE uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `profile` | User's display name, profile image, and status message |
+/// | `openid` | ID token for OpenID Connect |
+/// | `email` | User's email address |
+///
+/// See the full list at <https://developers.line.biz/en/docs/line-login/integrate-line-login/#scopes>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Line, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let line = Line::new(
+///     "your-channel-id",
+///     "your-channel-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = line.authorization_url(&state, &["profile", "openid"], &code_verifier);
+///
+/// // Step 2: Exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = line
+///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = line
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Line {
     client_id: String,
     client_secret: String,
@@ -16,6 +70,26 @@ pub struct Line {
 }
 
 impl Line {
+    /// Creates a new LINE OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The Channel ID from the LINE Developers Console.
+    /// * `client_secret` - The Channel Secret from the LINE Developers Console.
+    /// * `redirect_uri` - The URI LINE will redirect to after authorization. Must match
+    ///   the Callback URL configured in your LINE channel settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Line;
+    ///
+    /// let line = Line::new(
+    ///     "your-channel-id",
+    ///     "your-channel-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -33,6 +107,28 @@ impl Line {
 
 #[cfg(any(test, feature = "testing"))]
 impl Line {
+    /// Creates a LINE client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Line;
+    ///
+    /// let line = Line::with_endpoints(
+    ///     "test-channel-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -51,10 +147,37 @@ impl Line {
 }
 
 impl Line {
+    /// Returns the provider name (`"Line"`).
     pub fn name(&self) -> &'static str {
         "Line"
     }
 
+    /// Builds the LINE authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 and PKCE parameters. Your
+    /// application should store `state` and `code_verifier` in the user's session
+    /// before redirecting, as both are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["profile", "openid"]`).
+    /// * `code_verifier` - The PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Line, generate_state, generate_code_verifier};
+    ///
+    /// let line = Line::new("channel-id", "channel-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = line.authorization_url(&state, &["profile", "email"], &verifier);
+    /// assert!(url.as_str().starts_with("https://access.line.me/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
         let mut url =
             url::Url::parse(&self.authorization_endpoint).expect("invalid authorization endpoint");
@@ -74,6 +197,40 @@ impl Line {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after LINE redirects back with a `code`
+    /// query parameter. The `code_verifier` must be the same value used to generate the
+    /// authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if LINE rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Line, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let line = Line::new("channel-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = line
+    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -92,6 +249,38 @@ impl Line {
         send_token_request(http_client, request).await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// LINE access tokens typically expire after 30 days. If your initial token response
+    /// included a refresh token, you can use it to obtain a new access token without user
+    /// interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Line, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let line = Line::new("channel-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = line
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

@@ -7,6 +7,63 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://auth.mercadolibre.com/authorization";
 const TOKEN_ENDPOINT: &str = "https://api.mercadolibre.com/oauth/token";
 
+/// OAuth 2.0 client for [Mercado Libre](https://developers.mercadolibre.com/en_us/authentication-and-authorization).
+///
+/// Mercado Libre requires PKCE with the S256 challenge method on all authorization requests.
+/// This client sends credentials in the request body and supports token refresh. Note that
+/// Mercado Libre does not use explicit scopes in the authorization URL - permissions are
+/// configured per application in the developer console. Token revocation is not supported.
+///
+/// # Setup
+///
+/// 1. Create an application in the [Mercado Libre Developer Console](https://developers.mercadolibre.com/apps).
+/// 2. Obtain your client ID and client secret from the application settings.
+/// 3. Set the redirect URI to match the `redirect_uri` you pass to [`MercadoLibre::new`].
+///
+/// # Scopes
+///
+/// Mercado Libre does not use OAuth scopes in the traditional sense. Instead, permissions
+/// are requested when creating your application and are tied to your client ID. Common
+/// permissions include:
+///
+/// - **read** - Read user data
+/// - **write** - Create and modify listings
+/// - **offline_access** - Obtain refresh tokens
+///
+/// See <https://developers.mercadolibre.com/en_us/authentication-and-authorization> for details.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{MercadoLibre, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let mercado_libre = MercadoLibre::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = mercado_libre.authorization_url(&state, &code_verifier);
+/// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = mercado_libre
+///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = mercado_libre
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct MercadoLibre {
     client_id: String,
     client_secret: String,
@@ -16,6 +73,26 @@ pub struct MercadoLibre {
 }
 
 impl MercadoLibre {
+    /// Creates a new Mercado Libre OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from the Mercado Libre Developer Console.
+    /// * `client_secret` - The OAuth 2.0 client secret from the Mercado Libre Developer Console.
+    /// * `redirect_uri` - The URI Mercado Libre will redirect to after authorization. Must match
+    ///   the redirect URI configured in your application settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::MercadoLibre;
+    ///
+    /// let mercado_libre = MercadoLibre::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -33,6 +110,28 @@ impl MercadoLibre {
 
 #[cfg(any(test, feature = "testing"))]
 impl MercadoLibre {
+    /// Creates a Mercado Libre client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::MercadoLibre;
+    ///
+    /// let mercado_libre = MercadoLibre::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -51,10 +150,39 @@ impl MercadoLibre {
 }
 
 impl MercadoLibre {
+    /// Returns the provider name (`"MercadoLibre"`).
     pub fn name(&self) -> &'static str {
         "MercadoLibre"
     }
 
+    /// Builds the Mercado Libre authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 and PKCE parameters. Your
+    /// application should store `state` and `code_verifier` in the user's session
+    /// before redirecting, as both are needed to complete the flow.
+    ///
+    /// Note: Mercado Libre does not accept a scope parameter. Permissions are configured
+    /// in your application settings.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `code_verifier` - The PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{MercadoLibre, generate_state, generate_code_verifier};
+    ///
+    /// let ml = MercadoLibre::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = ml.authorization_url(&state, &verifier);
+    /// assert!(url.as_str().starts_with("https://auth.mercadolibre.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, code_verifier: &str) -> url::Url {
         let mut url =
             url::Url::parse(&self.authorization_endpoint).expect("invalid authorization endpoint");
@@ -71,6 +199,40 @@ impl MercadoLibre {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Mercado Libre redirects back with a `code`
+    /// query parameter. The `code_verifier` must be the same value used to generate the
+    /// authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Mercado Libre rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{MercadoLibre, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let ml = MercadoLibre::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = ml
+    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -89,6 +251,38 @@ impl MercadoLibre {
         send_token_request(http_client, request).await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Mercado Libre access tokens typically expire after 6 hours. If your application
+    /// has the offline_access permission, you can use the refresh token to obtain a new
+    /// access token without user interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{MercadoLibre, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let ml = MercadoLibre::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = ml
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

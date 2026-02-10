@@ -6,6 +6,61 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://www.reddit.com/api/v1/authorize";
 const TOKEN_ENDPOINT: &str = "https://www.reddit.com/api/v1/access_token";
 
+/// OAuth 2.0 client for [Reddit](https://www.reddit.com/dev/api/oauth).
+///
+/// Reddit uses standard OAuth 2.0 authorization code flow without PKCE.
+/// The client supports authorization, token exchange, and token refresh.
+///
+/// # Setup
+///
+/// 1. Create an application in your [Reddit app preferences](https://www.reddit.com/prefs/apps).
+/// 2. Select "web app" as the app type to receive a client ID and client secret.
+/// 3. Set the redirect URI to match your application's callback URL.
+///
+/// # Scopes
+///
+/// Reddit uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `identity` | Access to user account information |
+/// | `edit` | Edit and delete posts and comments |
+/// | `read` | Read posts and comments |
+/// | `submit` | Submit links and comments |
+/// | `vote` | Submit and change votes |
+///
+/// See the full list at <https://www.reddit.com/dev/api/oauth>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Reddit, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let provider = Reddit::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = provider.authorization_url(&state, &["identity", "read"]);
+///
+/// // Step 2: Exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = provider
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = provider
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Reddit {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -13,6 +68,26 @@ pub struct Reddit {
 }
 
 impl Reddit {
+    /// Creates a new Reddit OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from Reddit's app preferences.
+    /// * `client_secret` - The OAuth 2.0 client secret from Reddit's app preferences.
+    /// * `redirect_uri` - The URI Reddit will redirect to after authorization.
+    ///   Must match one configured in your app settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Reddit;
+    ///
+    /// let provider = Reddit::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +107,28 @@ impl Reddit {
 
 #[cfg(any(test, feature = "testing"))]
 impl Reddit {
+    /// Creates a Reddit client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Reddit;
+    ///
+    /// let provider = Reddit::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -52,15 +149,69 @@ impl Reddit {
 }
 
 impl Reddit {
+    /// Returns the provider name (`"Reddit"`).
     pub fn name(&self) -> &'static str {
         "Reddit"
     }
 
+    /// Builds the Reddit authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token. Use [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["identity", "read"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Reddit, generate_state};
+    ///
+    /// let provider = Reddit::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = provider.authorization_url(&state, &["identity", "read"]);
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         self.client
             .create_authorization_url(&self.authorization_endpoint, state, scopes)
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Reddit redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Reddit rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Reddit, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let provider = Reddit::new("client-id", "client-secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = provider
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -71,6 +222,37 @@ impl Reddit {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Reddit access tokens typically expire after 1 hour. Use this method to
+    /// obtain a new access token without requiring the user to re-authenticate.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Reddit, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let provider = Reddit::new("client-id", "client-secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = provider
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

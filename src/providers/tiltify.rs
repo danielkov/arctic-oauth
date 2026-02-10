@@ -6,6 +6,63 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://v5api.tiltify.com/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://v5api.tiltify.com/oauth/token";
 
+/// OAuth 2.0 client for [Tiltify](https://developers.tiltify.com/).
+///
+/// Tiltify does not require PKCE on authorization requests. This client supports
+/// the authorization code flow with token refresh. Credentials are sent in the
+/// request body rather than via HTTP Basic authentication.
+///
+/// # Setup
+///
+/// 1. Create an application in the [Tiltify Developer Dashboard](https://developers.tiltify.com/applications).
+/// 2. Copy your client ID and client secret from the application settings.
+/// 3. Configure the redirect URI to match what you pass to [`Tiltify::new`].
+///
+/// # Scopes
+///
+/// Tiltify uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `public` | Read public campaign data |
+/// | `campaign:read` | Read campaign details |
+/// | `team:read` | Read team information |
+/// | `user:read` | Read user profile |
+/// | `donation:read` | Read donation data |
+///
+/// See the full list at <https://developers.tiltify.com/api-reference/public#section/Authentication/Getting-a-User-Access-Token>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Tiltify, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let tiltify = Tiltify::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let url = tiltify.authorization_url(&state, &["public", "user:read"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = tiltify
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = tiltify
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Tiltify {
     client_id: String,
     client_secret: String,
@@ -15,6 +72,26 @@ pub struct Tiltify {
 }
 
 impl Tiltify {
+    /// Creates a new Tiltify OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The client ID from your Tiltify application.
+    /// * `client_secret` - The client secret from your Tiltify application.
+    /// * `redirect_uri` - The URI Tiltify will redirect to after authorization. Must match
+    ///   the redirect URI configured in your Tiltify application.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Tiltify;
+    ///
+    /// let tiltify = Tiltify::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +109,28 @@ impl Tiltify {
 
 #[cfg(any(test, feature = "testing"))]
 impl Tiltify {
+    /// Creates a Tiltify client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Tiltify;
+    ///
+    /// let tiltify = Tiltify::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,10 +149,33 @@ impl Tiltify {
 }
 
 impl Tiltify {
+    /// Returns the provider name (`"Tiltify"`).
     pub fn name(&self) -> &'static str {
         "Tiltify"
     }
 
+    /// Builds the Tiltify authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["public", "user:read"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Tiltify, generate_state};
+    ///
+    /// let tiltify = Tiltify::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = tiltify.authorization_url(&state, &["public", "campaign:read"]);
+    /// assert!(url.as_str().starts_with("https://v5api.tiltify.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -74,6 +196,38 @@ impl Tiltify {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Tiltify redirects back with a `code`
+    /// query parameter. The client credentials are sent in the request body.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Tiltify rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Tiltify, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let tiltify = Tiltify::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = tiltify
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -90,6 +244,38 @@ impl Tiltify {
         send_token_request(http_client, request).await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Tiltify access tokens expire after a set period. If your initial token response
+    /// included a refresh token, you can use it to obtain a new access token without
+    /// user interaction. The client credentials are sent in the request body.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Tiltify, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let tiltify = Tiltify::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = tiltify
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

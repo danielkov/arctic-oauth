@@ -6,6 +6,55 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://linear.app/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.linear.app/oauth/token";
 
+/// OAuth 2.0 client for [Linear](https://linear.app/developers/oauth-2-0-authentication).
+///
+/// Linear uses the standard authorization code flow without requiring PKCE.
+/// This client supports token exchange using client credentials sent in the request body.
+///
+/// # Setup
+///
+/// 1. Create an OAuth application in your [Linear workspace settings](https://linear.app/settings/api).
+/// 2. Note your client ID and client secret from the application page.
+/// 3. Set the callback URL to match the `redirect_uri` you pass to [`Linear::new`].
+///
+/// # Scopes
+///
+/// Linear uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `read` | Read access to workspace data |
+/// | `write` | Write access to workspace data |
+/// | `issues:create` | Create issues |
+///
+/// See the full list at <https://linear.app/developers/oauth-2-0-authentication>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Linear, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let linear = Linear::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = linear.authorization_url(&state, &["read", "write"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = linear
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct Linear {
     client_id: String,
     client_secret: String,
@@ -15,6 +64,26 @@ pub struct Linear {
 }
 
 impl Linear {
+    /// Creates a new Linear OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from your Linear application settings.
+    /// * `client_secret` - The OAuth 2.0 client secret from your Linear application settings.
+    /// * `redirect_uri` - The URI Linear will redirect to after authorization. Must match
+    ///   the callback URL configured in your Linear application.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Linear;
+    ///
+    /// let linear = Linear::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +101,28 @@ impl Linear {
 
 #[cfg(any(test, feature = "testing"))]
 impl Linear {
+    /// Creates a Linear client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Linear;
+    ///
+    /// let linear = Linear::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,10 +141,34 @@ impl Linear {
 }
 
 impl Linear {
+    /// Returns the provider name (`"Linear"`).
     pub fn name(&self) -> &'static str {
         "Linear"
     }
 
+    /// Builds the Linear authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to prevent CSRF attacks.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["read", "write"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Linear, generate_state};
+    ///
+    /// let linear = Linear::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = linear.authorization_url(&state, &["read", "write"]);
+    /// assert!(url.as_str().starts_with("https://linear.app/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -74,6 +189,38 @@ impl Linear {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Linear redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Linear rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Linear, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let linear = Linear::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = linear
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

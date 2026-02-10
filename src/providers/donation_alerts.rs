@@ -6,6 +6,60 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://www.donationalerts.com/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://www.donationalerts.com/oauth/token";
 
+/// OAuth 2.0 client for [DonationAlerts](https://www.donationalerts.com/apidoc#authorization).
+///
+/// DonationAlerts does not use PKCE or state parameters in the authorization flow.
+/// This client supports the authorization code flow including token refresh but not
+/// token revocation.
+///
+/// # Setup
+///
+/// 1. Register your application at the [DonationAlerts Application Management](https://www.donationalerts.com/application/clients) page.
+/// 2. Obtain your Client ID and Client Secret from the application settings.
+/// 3. Configure the redirect URI to match the `redirect_uri` you pass to [`DonationAlerts::new`].
+///
+/// # Scopes
+///
+/// DonationAlerts uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `oauth-user-show` | Read user profile information |
+/// | `oauth-donation-subscribe` | Subscribe to donation alerts |
+/// | `oauth-donation-index` | Read donation history |
+///
+/// See the full list at <https://www.donationalerts.com/apidoc#authorization__scopes>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{DonationAlerts, ReqwestClient};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let donation_alerts = DonationAlerts::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Redirect the user (no state or PKCE required).
+/// let url = donation_alerts.authorization_url(&["oauth-user-show"]);
+/// // Redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = donation_alerts
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = donation_alerts
+///     .refresh_access_token(&http, tokens.refresh_token()?, &["oauth-user-show"])
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct DonationAlerts {
     client_id: String,
     client_secret: String,
@@ -15,6 +69,26 @@ pub struct DonationAlerts {
 }
 
 impl DonationAlerts {
+    /// Creates a new DonationAlerts OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from DonationAlerts application settings.
+    /// * `client_secret` - The OAuth 2.0 client secret from DonationAlerts application settings.
+    /// * `redirect_uri` - The URI DonationAlerts will redirect to after authorization. Must match
+    ///   the redirect URI configured in your DonationAlerts application.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::DonationAlerts;
+    ///
+    /// let donation_alerts = DonationAlerts::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +106,28 @@ impl DonationAlerts {
 
 #[cfg(any(test, feature = "testing"))]
 impl DonationAlerts {
+    /// Creates a DonationAlerts client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::DonationAlerts;
+    ///
+    /// let donation_alerts = DonationAlerts::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,11 +146,29 @@ impl DonationAlerts {
 }
 
 impl DonationAlerts {
+    /// Returns the provider name (`"DonationAlerts"`).
     pub fn name(&self) -> &'static str {
         "DonationAlerts"
     }
 
-    /// No state parameter -- takes only scopes. Scope is always sent (even when empty).
+    /// Builds the DonationAlerts authorization URL that the user should be redirected to.
+    ///
+    /// DonationAlerts does not use state or PKCE parameters. The scope parameter is always
+    /// included in the URL, even when empty.
+    ///
+    /// # Arguments
+    ///
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["oauth-user-show"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::DonationAlerts;
+    ///
+    /// let donation_alerts = DonationAlerts::new("client-id", "secret", "https://example.com/cb");
+    /// let url = donation_alerts.authorization_url(&["oauth-user-show"]);
+    /// assert!(url.as_str().starts_with("https://www.donationalerts.com/"));
+    /// ```
     pub fn authorization_url(&self, scopes: &[&str]) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -71,6 +185,38 @@ impl DonationAlerts {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after DonationAlerts redirects back with a `code`
+    /// query parameter. Credentials are sent in the POST body (not via Basic auth).
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if DonationAlerts rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{DonationAlerts, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let donation_alerts = DonationAlerts::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = donation_alerts
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -88,7 +234,38 @@ impl DonationAlerts {
         send_token_request(http_client, request).await
     }
 
-    /// Refresh with scopes parameter sent in the body.
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// DonationAlerts requires scopes to be included in the refresh request. The scope parameter
+    /// is always sent in the body, even when empty.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    /// * `scopes` - The OAuth 2.0 scopes to request in the refreshed token.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{DonationAlerts, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let donation_alerts = DonationAlerts::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = donation_alerts
+    ///     .refresh_access_token(&http, "stored-refresh-token", &["oauth-user-show"])
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

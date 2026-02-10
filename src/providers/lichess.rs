@@ -7,6 +7,57 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://lichess.org/oauth";
 const TOKEN_ENDPOINT: &str = "https://lichess.org/api/token";
 
+/// OAuth 2.0 client for [Lichess](https://lichess.org/api).
+///
+/// Lichess requires PKCE with the S256 challenge method on all authorization requests.
+/// This is a public client (no client secret required) that supports the authorization
+/// code flow with optional token refresh. Lichess does not support token revocation.
+///
+/// # Setup
+///
+/// 1. Create an OAuth application at <https://lichess.org/account/oauth/app/create>.
+/// 2. Obtain your client ID from the application settings.
+/// 3. Set the redirect URI to match the `redirect_uri` you pass to [`Lichess::new`].
+///
+/// # Scopes
+///
+/// Lichess uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `challenge:read` | Read received challenges |
+/// | `puzzle:read` | Read puzzle activity |
+/// | `tournament:write` | Create and join tournaments |
+/// | `email:read` | Read email address |
+///
+/// See the full list at <https://lichess.org/api#tag/oauth>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Lichess, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let lichess = Lichess::new(
+///     "your-client-id",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = lichess.authorization_url(&state, &["challenge:read", "puzzle:read"], &code_verifier);
+/// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = lichess
+///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct Lichess {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -14,6 +65,26 @@ pub struct Lichess {
 }
 
 impl Lichess {
+    /// Creates a new Lichess OAuth 2.0 client configured with production endpoints.
+    ///
+    /// Note: Lichess is a public client and does not require a client secret.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from your Lichess application.
+    /// * `redirect_uri` - The URI Lichess will redirect to after authorization. Must match
+    ///   the redirect URI configured in your Lichess application settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Lichess;
+    ///
+    /// let lichess = Lichess::new(
+    ///     "your-client-id",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         redirect_uri: impl Into<String>,
@@ -28,6 +99,27 @@ impl Lichess {
 
 #[cfg(any(test, feature = "testing"))]
 impl Lichess {
+    /// Creates a Lichess client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Lichess;
+    ///
+    /// let lichess = Lichess::with_endpoints(
+    ///     "test-client-id",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         redirect_uri: impl Into<String>,
@@ -43,10 +135,38 @@ impl Lichess {
 }
 
 impl Lichess {
+    /// Returns the provider name (`"Lichess"`).
     pub fn name(&self) -> &'static str {
         "Lichess"
     }
 
+    /// Builds the Lichess authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 and PKCE parameters. Your
+    /// application should store `state` and `code_verifier` in the user's session
+    /// before redirecting, as both are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["challenge:read", "puzzle:read"]`).
+    ///   Pass an empty slice for the default scope.
+    /// * `code_verifier` - The PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Lichess, generate_state, generate_code_verifier};
+    ///
+    /// let lichess = Lichess::new("client-id", "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = lichess.authorization_url(&state, &["challenge:read"], &verifier);
+    /// assert!(url.as_str().starts_with("https://lichess.org/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str], code_verifier: &str) -> url::Url {
         self.client.create_authorization_url_with_pkce(
             &self.authorization_endpoint,
@@ -57,6 +177,40 @@ impl Lichess {
         )
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Lichess redirects back with a `code`
+    /// query parameter. The `code_verifier` must be the same value used to generate the
+    /// authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Lichess rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Lichess, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let lichess = Lichess::new("client-id", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = lichess
+    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

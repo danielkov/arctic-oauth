@@ -6,6 +6,48 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://anilist.co/api/v2/oauth/authorize";
 const TOKEN_ENDPOINT: &str = "https://anilist.co/api/v2/oauth/token";
 
+/// OAuth 2.0 client for [AniList](https://anilist.gitbook.io/anilist-apiv2-docs/docs/guide/auth/index).
+///
+/// AniList does not require PKCE and does not use OAuth scopes. This client supports
+/// the authorization code flow for obtaining access tokens.
+///
+/// # Setup
+///
+/// 1. Navigate to [AniList Developer Settings](https://anilist.co/settings/developer) while logged in.
+/// 2. Create a new API client and obtain your Client ID and Client Secret.
+/// 3. Set the redirect URI to match the `redirect_uri` you pass to [`AniList::new`].
+///
+/// # Scopes
+///
+/// AniList does not use OAuth 2.0 scopes. All authenticated requests have access to the
+/// same set of permissions based on the user's authorization.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{AniList, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let anilist = AniList::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = anilist.authorization_url(&state);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: Exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = anilist
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct AniList {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -13,6 +55,26 @@ pub struct AniList {
 }
 
 impl AniList {
+    /// Creates a new AniList OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from AniList's developer settings.
+    /// * `client_secret` - The OAuth 2.0 client secret from AniList's developer settings.
+    /// * `redirect_uri` - The URI AniList will redirect to after authorization.
+    ///   Must match one configured in your app settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::AniList;
+    ///
+    /// let anilist = AniList::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +94,28 @@ impl AniList {
 
 #[cfg(any(test, feature = "testing"))]
 impl AniList {
+    /// Creates an AniList client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::AniList;
+    ///
+    /// let anilist = AniList::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -52,15 +136,69 @@ impl AniList {
 }
 
 impl AniList {
+    /// Returns the provider name (`"AniList"`).
     pub fn name(&self) -> &'static str {
         "AniList"
     }
 
+    /// Builds the AniList authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to prevent CSRF attacks.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token. Use [`generate_state`](crate::generate_state) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{AniList, generate_state};
+    ///
+    /// let anilist = AniList::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = anilist.authorization_url(&state);
+    /// assert!(url.as_str().starts_with("https://anilist.co/"));
+    /// ```
     pub fn authorization_url(&self, state: &str) -> url::Url {
         self.client
             .create_authorization_url(&self.authorization_endpoint, state, &[])
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after AniList redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if AniList rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{AniList, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let anilist = AniList::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = anilist
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

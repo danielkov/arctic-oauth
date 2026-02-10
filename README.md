@@ -33,17 +33,17 @@ Rust-first OAuth 2.0 authorization-code client that ports the ergonomics of the 
 
 ## Feature matrix
 
-| Capability                                          | Status                                |
-| --------------------------------------------------- | ------------------------------------- |
-| Authorization-code flow                             | ✅                                    |
-| PKCE utilities (S256 + plain)                       | ✅                                    |
-| State (anti-CSRF) generator                         | ✅                                    |
-| ID token (JWT) payload decoding                     | ✅ (no signature verification)        |
-| Pluggable HTTP client trait                         | ✅                                    |
-| Built-in providers                                  | 64 providers (see full list below)    |
-| Token refresh helpers                               | ✅ (per provider support)             |
-| RFC 7009 token revocation                           | ✅ (where the provider supports it)   |
-| Other grants (implicit, device, client credentials) | ❌ (out of scope)                     |
+| Capability                                          | Status                              |
+| --------------------------------------------------- | ----------------------------------- |
+| Authorization-code flow                             | ✅                                  |
+| PKCE utilities (S256 + plain)                       | ✅                                  |
+| State (anti-CSRF) generator                         | ✅                                  |
+| ID token (JWT) payload decoding                     | ✅ (no signature verification)      |
+| Pluggable HTTP client trait                         | ✅                                  |
+| Built-in providers                                  | 64 providers (see full list below)  |
+| Token refresh helpers                               | ✅ (per provider support)           |
+| RFC 7009 token revocation                           | ✅ (where the provider supports it) |
+| Other grants (implicit, device, client credentials) | ❌ (out of scope)                   |
 
 ## Installation
 
@@ -429,72 +429,72 @@ Trade-off: this design reduces cross-provider generic programming, but improves 
 
 The crate ships 64 pre-configured providers, each behind its own feature flag. Every provider encodes its production endpoints, HTTP authentication style, PKCE requirements, and spec deviations.
 
-| Provider | Feature flag | PKCE | Refresh | Revocation | Notes |
-| --- | --- | --- | --- | --- | --- |
-| Amazon Cognito | `amazon-cognito` | Required S256 | ✅ | ✅ | Requires `domain` parameter |
-| AniList | `anilist` | Not supported | ✅ | ❌ | |
-| Apple | `apple` | Not supported | ❌ | ❌ | Requires `team_id`, `key_id`, `pkcs8_private_key`; generates JWT client secret |
-| Atlassian | `atlassian` | Required S256 | ✅ | ❌ | |
-| Auth0 | `auth0` | Optional | ✅ | ✅ | Requires `domain` parameter |
-| Authentik | `authentik` | Required S256 | ✅ | ✅ | Requires `base_url` parameter |
-| Autodesk | `autodesk` | Not supported | ✅ | ❌ | |
-| Battle.net | `battle-net` | Not supported | ❌ | ❌ | |
-| Bitbucket | `bitbucket` | Not supported | ✅ | ❌ | |
-| Box | `box-oauth` | Not supported | ✅ | ✅ | |
-| Bungie | `bungie` | Not supported | ✅ | ❌ | Uses `X-API-Key` header |
-| Coinbase | `coinbase` | Not supported | ✅ | ✅ | |
-| Discord | `discord` | Optional | ✅ | ✅ | Supports public clients (optional secret) |
-| Donation Alerts | `donation-alerts` | Not supported | ✅ | ❌ | No `state` parameter |
-| Dribbble | `dribbble` | Not supported | ❌ | ❌ | |
-| Dropbox | `dropbox` | Required S256 | ✅ | ✅ | Supports public clients (optional secret) |
-| Epic Games | `epic-games` | Not supported | ✅ | ❌ | |
-| Etsy | `etsy` | Required S256 | ✅ | ❌ | |
-| Facebook | `facebook` | Not supported | ❌ | ❌ | |
-| Figma | `figma` | Not supported | ✅ | ❌ | Separate refresh endpoint |
-| 42 | `forty-two` | Not supported | ✅ | ❌ | |
-| Gitea | `gitea` | Not supported | ✅ | ❌ | Requires `base_url` parameter |
-| GitHub | `github` | Not supported | ❌ | ❌ | Returns errors with HTTP 200 |
-| GitLab | `gitlab` | Required S256 | ✅ | ✅ | Requires `base_url` parameter |
-| Google | `google` | Required S256 | ✅ | ✅ | Returns OIDC `id_token` |
-| Intuit | `intuit` | Not supported | ✅ | ✅ | |
-| Kakao | `kakao` | Not supported | ✅ | ❌ | |
-| KeyCloak | `keycloak` | Required S256 | ✅ | ✅ | Requires `realm_url` parameter |
-| Kick | `kick` | Not supported | ✅ | ❌ | |
-| Lichess | `lichess` | Required S256 | ❌ | ❌ | |
-| Line | `line` | Not supported | ✅ | ✅ | |
-| Linear | `linear` | Not supported | ✅ | ❌ | |
-| LinkedIn | `linkedin` | Required S256 | ✅ | ❌ | |
-| Mastodon | `mastodon` | Required S256 | ❌ | ✅ | Requires `base_url` parameter |
-| Mercado Libre | `mercado-libre` | Not supported | ✅ | ❌ | |
-| Mercado Pago | `mercado-pago` | Not supported | ✅ | ❌ | |
-| Microsoft Entra ID | `microsoft-entra-id` | Required S256 | ✅ | ❌ | Requires `tenant`; supports public clients |
-| MyAnimeList | `my-anime-list` | Required Plain | ✅ | ❌ | Uses Plain PKCE (not S256) |
-| Naver | `naver` | Not supported | ✅ | ❌ | No `state` or `scopes` parameters |
-| Notion | `notion` | Not supported | ❌ | ❌ | Adds `owner=user` parameter |
-| Okta | `okta` | Required S256 | ✅ | ✅ | Requires `domain`; optional `authorization_server_id` |
-| osu! | `osu` | Not supported | ✅ | ❌ | |
-| Patreon | `patreon` | Not supported | ✅ | ❌ | |
-| Polar | `polar` | Required S256 | ✅ | ✅ | Supports public clients (optional secret) |
-| Reddit | `reddit` | Not supported | ✅ | ❌ | |
-| Roblox | `roblox` | Required S256 | ✅ | ❌ | |
-| Salesforce | `salesforce` | Required S256 | ✅ | ✅ | Requires `domain` parameter |
-| Shikimori | `shikimori` | Not supported | ✅ | ❌ | |
-| Slack | `slack` | Not supported | ✅ | ❌ | Supports public clients (optional secret) |
-| Spotify | `spotify` | Optional | ✅ | ❌ | Supports public clients (optional secret) |
-| start.gg | `start-gg` | Not supported | ✅ | ❌ | Separate refresh endpoint |
-| Strava | `strava` | Not supported | ✅ | ❌ | Comma-delimited scopes |
-| Synology | `synology` | Required S256 | ❌ | ❌ | Requires `base_url`; uses `application_id`/`application_secret` |
-| TikTok | `tiktok` | Required S256 | ✅ | ✅ | Uses `client_key`; returns errors with HTTP 200 |
-| Tiltify | `tiltify` | Not supported | ✅ | ❌ | |
-| Tumblr | `tumblr` | Not supported | ✅ | ❌ | |
-| Twitch | `twitch` | Not supported | ✅ | ✅ | |
-| Twitter | `twitter` | Required S256 | ✅ | ✅ | Supports public clients (optional secret) |
-| VK | `vk` | Not supported | ❌ | ❌ | |
-| Withings | `withings` | Not supported | ❌ | ❌ | Comma-delimited scopes; wraps responses |
-| WorkOS | `workos` | Optional | ❌ | ❌ | Optional secret; no scopes parameter |
-| Yahoo | `yahoo` | Not supported | ✅ | ❌ | |
-| Yandex | `yandex` | Not supported | ✅ | ❌ | |
-| Zoom | `zoom` | Required S256 | ✅ | ✅ | |
+| Provider           | Feature flag         | PKCE           | Refresh | Revocation | Notes                                                                          |
+| ------------------ | -------------------- | -------------- | ------- | ---------- | ------------------------------------------------------------------------------ |
+| Amazon Cognito     | `amazon-cognito`     | Required S256  | ✅      | ✅         | Requires `domain` parameter                                                    |
+| AniList            | `anilist`            | Not supported  | ✅      | ❌         |                                                                                |
+| Apple              | `apple`              | Not supported  | ❌      | ❌         | Requires `team_id`, `key_id`, `pkcs8_private_key`; generates JWT client secret |
+| Atlassian          | `atlassian`          | Required S256  | ✅      | ❌         |                                                                                |
+| Auth0              | `auth0`              | Optional       | ✅      | ✅         | Requires `domain` parameter                                                    |
+| Authentik          | `authentik`          | Required S256  | ✅      | ✅         | Requires `base_url` parameter                                                  |
+| Autodesk           | `autodesk`           | Not supported  | ✅      | ❌         |                                                                                |
+| Battle.net         | `battle-net`         | Not supported  | ❌      | ❌         |                                                                                |
+| Bitbucket          | `bitbucket`          | Not supported  | ✅      | ❌         |                                                                                |
+| Box                | `box-oauth`          | Not supported  | ✅      | ✅         |                                                                                |
+| Bungie             | `bungie`             | Not supported  | ✅      | ❌         | Uses `X-API-Key` header                                                        |
+| Coinbase           | `coinbase`           | Not supported  | ✅      | ✅         |                                                                                |
+| Discord            | `discord`            | Optional       | ✅      | ✅         | Supports public clients (optional secret)                                      |
+| Donation Alerts    | `donation-alerts`    | Not supported  | ✅      | ❌         | No `state` parameter                                                           |
+| Dribbble           | `dribbble`           | Not supported  | ❌      | ❌         |                                                                                |
+| Dropbox            | `dropbox`            | Required S256  | ✅      | ✅         | Supports public clients (optional secret)                                      |
+| Epic Games         | `epic-games`         | Not supported  | ✅      | ❌         |                                                                                |
+| Etsy               | `etsy`               | Required S256  | ✅      | ❌         |                                                                                |
+| Facebook           | `facebook`           | Not supported  | ❌      | ❌         |                                                                                |
+| Figma              | `figma`              | Not supported  | ✅      | ❌         | Separate refresh endpoint                                                      |
+| 42                 | `forty-two`          | Not supported  | ✅      | ❌         |                                                                                |
+| Gitea              | `gitea`              | Not supported  | ✅      | ❌         | Requires `base_url` parameter                                                  |
+| GitHub             | `github`             | Not supported  | ❌      | ❌         | Returns errors with HTTP 200                                                   |
+| GitLab             | `gitlab`             | Required S256  | ✅      | ✅         | Requires `base_url` parameter                                                  |
+| Google             | `google`             | Required S256  | ✅      | ✅         | Returns OIDC `id_token`                                                        |
+| Intuit             | `intuit`             | Not supported  | ✅      | ✅         |                                                                                |
+| Kakao              | `kakao`              | Not supported  | ✅      | ❌         |                                                                                |
+| KeyCloak           | `keycloak`           | Required S256  | ✅      | ✅         | Requires `realm_url` parameter                                                 |
+| Kick               | `kick`               | Not supported  | ✅      | ❌         |                                                                                |
+| Lichess            | `lichess`            | Required S256  | ❌      | ❌         |                                                                                |
+| Line               | `line`               | Not supported  | ✅      | ✅         |                                                                                |
+| Linear             | `linear`             | Not supported  | ✅      | ❌         |                                                                                |
+| LinkedIn           | `linkedin`           | Required S256  | ✅      | ❌         |                                                                                |
+| Mastodon           | `mastodon`           | Required S256  | ❌      | ✅         | Requires `base_url` parameter                                                  |
+| Mercado Libre      | `mercado-libre`      | Not supported  | ✅      | ❌         |                                                                                |
+| Mercado Pago       | `mercado-pago`       | Not supported  | ✅      | ❌         |                                                                                |
+| Microsoft Entra ID | `microsoft-entra-id` | Required S256  | ✅      | ❌         | Requires `tenant`; supports public clients                                     |
+| MyAnimeList        | `my-anime-list`      | Required Plain | ✅      | ❌         | Uses Plain PKCE (not S256)                                                     |
+| Naver              | `naver`              | Not supported  | ✅      | ❌         | No `state` or `scopes` parameters                                              |
+| Notion             | `notion`             | Not supported  | ❌      | ❌         | Adds `owner=user` parameter                                                    |
+| Okta               | `okta`               | Required S256  | ✅      | ✅         | Requires `domain`; optional `authorization_server_id`                          |
+| osu!               | `osu`                | Not supported  | ✅      | ❌         |                                                                                |
+| Patreon            | `patreon`            | Not supported  | ✅      | ❌         |                                                                                |
+| Polar              | `polar`              | Required S256  | ✅      | ✅         | Supports public clients (optional secret)                                      |
+| Reddit             | `reddit`             | Not supported  | ✅      | ❌         |                                                                                |
+| Roblox             | `roblox`             | Required S256  | ✅      | ❌         |                                                                                |
+| Salesforce         | `salesforce`         | Required S256  | ✅      | ✅         | Requires `domain` parameter                                                    |
+| Shikimori          | `shikimori`          | Not supported  | ✅      | ❌         |                                                                                |
+| Slack              | `slack`              | Not supported  | ✅      | ❌         | Supports public clients (optional secret)                                      |
+| Spotify            | `spotify`            | Optional       | ✅      | ❌         | Supports public clients (optional secret)                                      |
+| start.gg           | `start-gg`           | Not supported  | ✅      | ❌         | Separate refresh endpoint                                                      |
+| Strava             | `strava`             | Not supported  | ✅      | ❌         | Comma-delimited scopes                                                         |
+| Synology           | `synology`           | Required S256  | ❌      | ❌         | Requires `base_url`; uses `application_id`/`application_secret`                |
+| TikTok             | `tiktok`             | Required S256  | ✅      | ✅         | Uses `client_key`; returns errors with HTTP 200                                |
+| Tiltify            | `tiltify`            | Not supported  | ✅      | ❌         |                                                                                |
+| Tumblr             | `tumblr`             | Not supported  | ✅      | ❌         |                                                                                |
+| Twitch             | `twitch`             | Not supported  | ✅      | ✅         |                                                                                |
+| Twitter            | `twitter`            | Required S256  | ✅      | ✅         | Supports public clients (optional secret)                                      |
+| VK                 | `vk`                 | Not supported  | ❌      | ❌         |                                                                                |
+| Withings           | `withings`           | Not supported  | ❌      | ❌         | Comma-delimited scopes; wraps responses                                        |
+| WorkOS             | `workos`             | Optional       | ❌      | ❌         | Optional secret; no scopes parameter                                           |
+| Yahoo              | `yahoo`              | Not supported  | ✅      | ❌         |                                                                                |
+| Yandex             | `yandex`             | Not supported  | ✅      | ❌         |                                                                                |
+| Zoom               | `zoom`               | Required S256  | ✅      | ✅         |                                                                                |
 
 Use the `testing` feature (or plain `cargo test`) to access helper constructors such as `Google::with_endpoints` for pointing providers at mock OAuth servers.
 

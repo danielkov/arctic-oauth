@@ -6,6 +6,59 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://www.tumblr.com/oauth2/authorize";
 const TOKEN_ENDPOINT: &str = "https://api.tumblr.com/v2/oauth2/token";
 
+/// OAuth 2.0 client for [Tumblr](https://www.tumblr.com/docs/en/api/v2#oauth2-authorization).
+///
+/// Tumblr uses standard OAuth 2.0 authorization code flow without PKCE.
+/// The client supports authorization, token exchange, and token refresh.
+///
+/// # Setup
+///
+/// 1. Register an application in the [Tumblr Application Management](https://www.tumblr.com/oauth/apps).
+/// 2. Obtain your OAuth consumer key (client ID) and secret key (client secret).
+/// 3. Configure the Default callback URL to match your application's redirect URI.
+///
+/// # Scopes
+///
+/// Tumblr uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `basic` | Read basic user information and public posts |
+/// | `write` | Create, edit, and delete posts |
+/// | `offline_access` | Request refresh tokens for long-term access |
+///
+/// See the full list at <https://www.tumblr.com/docs/en/api/v2#oauth2-authorization>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Tumblr, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let provider = Tumblr::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = provider.authorization_url(&state, &["basic", "write"]);
+///
+/// // Step 2: Exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = provider
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = provider
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Tumblr {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -13,6 +66,26 @@ pub struct Tumblr {
 }
 
 impl Tumblr {
+    /// Creates a new Tumblr OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID (consumer key) from Tumblr's application management.
+    /// * `client_secret` - The OAuth 2.0 client secret (secret key) from Tumblr's application management.
+    /// * `redirect_uri` - The URI Tumblr will redirect to after authorization.
+    ///   Must match the callback URL configured in your app settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Tumblr;
+    ///
+    /// let provider = Tumblr::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +105,28 @@ impl Tumblr {
 
 #[cfg(any(test, feature = "testing"))]
 impl Tumblr {
+    /// Creates a Tumblr client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Tumblr;
+    ///
+    /// let provider = Tumblr::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -52,15 +147,69 @@ impl Tumblr {
 }
 
 impl Tumblr {
+    /// Returns the provider name (`"Tumblr"`).
     pub fn name(&self) -> &'static str {
         "Tumblr"
     }
 
+    /// Builds the Tumblr authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token. Use [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["basic", "write"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Tumblr, generate_state};
+    ///
+    /// let provider = Tumblr::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = provider.authorization_url(&state, &["basic", "write"]);
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         self.client
             .create_authorization_url(&self.authorization_endpoint, state, scopes)
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Tumblr redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Tumblr rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Tumblr, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let provider = Tumblr::new("client-id", "client-secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = provider
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -71,6 +220,38 @@ impl Tumblr {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Tumblr access tokens typically expire after 1 hour when using the `offline_access`
+    /// scope. Use this method to obtain a new access token without requiring the user to
+    /// re-authenticate.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Tumblr, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let provider = Tumblr::new("client-id", "client-secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = provider
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

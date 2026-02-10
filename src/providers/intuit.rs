@@ -7,6 +7,66 @@ const AUTHORIZATION_ENDPOINT: &str = "https://appcenter.intuit.com/connect/oauth
 const TOKEN_ENDPOINT: &str = "https://oauth.platform.intuit.com/oauth2/v1/tokens/bearer";
 const REVOCATION_ENDPOINT: &str = "https://developer.api.intuit.com/v2/oauth2/tokens/revoke";
 
+/// OAuth 2.0 client for [Intuit](https://developer.intuit.com/app/developer/qbo/docs/develop/authentication-and-authorization/oauth-2.0).
+///
+/// Intuit does not require PKCE. This client supports the full authorization code flow
+/// including token refresh and revocation for accessing QuickBooks Online and other
+/// Intuit services.
+///
+/// # Setup
+///
+/// 1. Create an app in the [Intuit Developer Portal](https://developer.intuit.com/app/developer/myapps).
+/// 2. Navigate to your app's **Keys & credentials** section to obtain your Client ID and Client Secret.
+/// 3. Add the redirect URI under **Keys & credentials > Redirect URIs** to match the `redirect_uri` you pass to [`Intuit::new`].
+///
+/// # Scopes
+///
+/// Intuit uses space-separated scopes with a reverse domain notation. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `com.intuit.quickbooks.accounting` | Access QuickBooks Online accounting data |
+/// | `com.intuit.quickbooks.payment` | Access QuickBooks payments |
+/// | `openid` | OpenID Connect authentication |
+/// | `profile` | User profile information |
+/// | `email` | User email address |
+///
+/// See the full list at <https://developer.intuit.com/app/developer/qbo/docs/develop/authentication-and-authorization/oauth-2.0#scopes>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Intuit, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let intuit = Intuit::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = intuit.authorization_url(&state, &["com.intuit.quickbooks.accounting", "openid"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: Exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = intuit
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = intuit
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+///
+/// // Step 4 (optional): Revoke a token.
+/// intuit.revoke_token(&http, tokens.access_token()?).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Intuit {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -15,6 +75,26 @@ pub struct Intuit {
 }
 
 impl Intuit {
+    /// Creates a new Intuit OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from Intuit Developer Portal.
+    /// * `client_secret` - The OAuth 2.0 client secret from Intuit Developer Portal.
+    /// * `redirect_uri` - The URI Intuit will redirect to after authorization.
+    ///   Must match one configured in your app settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Intuit;
+    ///
+    /// let intuit = Intuit::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -35,6 +115,29 @@ impl Intuit {
 
 #[cfg(any(test, feature = "testing"))]
 impl Intuit {
+    /// Creates an Intuit client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Intuit;
+    ///
+    /// let intuit = Intuit::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    ///     Some("http://localhost:8080/revoke"),
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -59,15 +162,70 @@ impl Intuit {
 }
 
 impl Intuit {
+    /// Returns the provider name (`"Intuit"`).
     pub fn name(&self) -> &'static str {
         "Intuit"
     }
 
+    /// Builds the Intuit authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to prevent CSRF attacks.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token. Use [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["com.intuit.quickbooks.accounting"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Intuit, generate_state};
+    ///
+    /// let intuit = Intuit::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = intuit.authorization_url(&state, &["com.intuit.quickbooks.accounting"]);
+    /// assert!(url.as_str().starts_with("https://appcenter.intuit.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         self.client
             .create_authorization_url(&self.authorization_endpoint, state, scopes)
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Intuit redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Intuit rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Intuit, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let intuit = Intuit::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = intuit
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -78,6 +236,38 @@ impl Intuit {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Intuit access tokens typically expire after 1 hour. Refresh tokens are valid
+    /// for 100 days. Use this method to obtain a new access token without requiring
+    /// the user to re-authenticate.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Intuit, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let intuit = Intuit::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = intuit
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -88,6 +278,34 @@ impl Intuit {
             .await
     }
 
+    /// Revokes an access token or refresh token.
+    ///
+    /// Use this when a user signs out or disconnects your application from their
+    /// Intuit account. Revoking a refresh token also invalidates the associated
+    /// access token.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `token` - The access token or refresh token to revoke.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedResponse`] if Intuit returns a non-200 status, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Intuit, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let intuit = Intuit::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// intuit.revoke_token(&http, "token-to-revoke").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

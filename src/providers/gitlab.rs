@@ -3,6 +3,69 @@ use crate::error::Error;
 use crate::http::HttpClient;
 use crate::tokens::OAuth2Tokens;
 
+/// OAuth 2.0 client for [GitLab](https://docs.gitlab.com/ee/api/oauth2.html).
+///
+/// GitLab follows the standard authorization code flow without requiring PKCE.
+/// This client supports both GitLab.com and self-hosted GitLab instances by allowing
+/// you to specify a custom base URL. The client supports token exchange, refresh,
+/// and revocation.
+///
+/// # Setup
+///
+/// 1. Go to your GitLab instance's **User Settings > Applications** (or for groups: **Group Settings > Applications**).
+/// 2. Create a new application and note the **Application ID** (client ID) and **Secret** (client secret).
+/// 3. Set the **Redirect URI** to match the `redirect_uri` you pass to [`GitLab::new`].
+///
+/// # Scopes
+///
+/// GitLab uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `read_user` | Read user profile |
+/// | `openid` | OpenID Connect authentication |
+/// | `profile` | User's profile information |
+/// | `email` | User's email address |
+/// | `api` | Complete API access |
+///
+/// See the full list at <https://docs.gitlab.com/ee/integration/oauth_provider.html#authorized-applications>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{GitLab, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// // For GitLab.com:
+/// let gitlab = GitLab::new(
+///     "https://gitlab.com",
+///     "your-client-id",
+///     Some("your-client-secret".into()),
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = gitlab.authorization_url(&state, &["read_user", "openid"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = gitlab
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = gitlab
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+///
+/// // Step 4 (optional): Revoke a token.
+/// gitlab.revoke_token(&http, tokens.access_token()?).await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct GitLab {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -11,6 +74,37 @@ pub struct GitLab {
 }
 
 impl GitLab {
+    /// Creates a new GitLab OAuth 2.0 client for a specific GitLab instance.
+    ///
+    /// # Arguments
+    ///
+    /// * `base_url` - The base URL of the GitLab instance (e.g. `"https://gitlab.com"` for
+    ///   GitLab.com or `"https://gitlab.example.com"` for self-hosted).
+    /// * `client_id` - The OAuth 2.0 application ID from GitLab.
+    /// * `client_secret` - Optional client secret. Use `None` for public clients.
+    /// * `redirect_uri` - The URI GitLab will redirect to after authorization.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::GitLab;
+    ///
+    /// // GitLab.com
+    /// let gitlab = GitLab::new(
+    ///     "https://gitlab.com",
+    ///     "your-client-id",
+    ///     Some("your-client-secret".into()),
+    ///     "https://example.com/callback",
+    /// );
+    ///
+    /// // Self-hosted
+    /// let gitlab_self = GitLab::new(
+    ///     "https://gitlab.mycompany.com",
+    ///     "your-client-id",
+    ///     Some("your-client-secret".into()),
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         base_url: impl Into<String>,
         client_id: impl Into<String>,
@@ -28,15 +122,70 @@ impl GitLab {
 }
 
 impl GitLab {
+    /// Returns the provider name (`"GitLab"`).
     pub fn name(&self) -> &'static str {
         "GitLab"
     }
 
+    /// Builds the GitLab authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application should
+    /// store `state` in the user's session before redirecting.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["read_user", "openid"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{GitLab, generate_state};
+    ///
+    /// let gitlab = GitLab::new("https://gitlab.com", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = gitlab.authorization_url(&state, &["read_user", "api"]);
+    /// assert!(url.as_str().starts_with("https://gitlab.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         self.client
             .create_authorization_url(&self.authorization_endpoint, state, scopes)
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after GitLab redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if GitLab rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{GitLab, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let gitlab = GitLab::new("https://gitlab.com", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = gitlab
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -47,6 +196,38 @@ impl GitLab {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// GitLab access tokens expire after a configurable period (typically 2 hours).
+    /// If your initial token response included a refresh token, you can use it to
+    /// obtain a new access token without user interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{GitLab, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let gitlab = GitLab::new("https://gitlab.com", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = gitlab
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -57,6 +238,33 @@ impl GitLab {
             .await
     }
 
+    /// Revokes an access token or refresh token.
+    ///
+    /// Use this when a user signs out or disconnects your application. GitLab will
+    /// invalidate the token and prevent further use.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `token` - The access token or refresh token to revoke.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::UnexpectedResponse`] if GitLab returns a non-200 status, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{GitLab, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let gitlab = GitLab::new("https://gitlab.com", "client-id", Some("secret".into()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// gitlab.revoke_token(&http, "token-to-revoke").await?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn revoke_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

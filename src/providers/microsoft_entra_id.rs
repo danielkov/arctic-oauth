@@ -4,6 +4,69 @@ use crate::pkce::{CodeChallengeMethod, create_code_challenge};
 use crate::request::{create_oauth2_request, encode_basic_credentials, send_token_request};
 use crate::tokens::OAuth2Tokens;
 
+/// OAuth 2.0 client for [Microsoft Entra ID](https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow) (formerly Azure AD).
+///
+/// Microsoft Entra ID requires PKCE with the S256 challenge method. This client supports both
+/// confidential clients (with a client secret, using Basic auth) and public clients (without
+/// a secret, using POST body credentials). The client supports the full authorization code
+/// flow including token refresh.
+///
+/// # Setup
+///
+/// 1. Go to the [Azure Portal](https://portal.azure.com/) and navigate to **Azure Active Directory > App registrations**.
+/// 2. Click **New registration** and configure your application.
+/// 3. Under **Authentication**, add a platform and configure the redirect URI to match the `redirect_uri` you pass to [`MicrosoftEntraId::new`].
+/// 4. Note your Application (client) ID and Directory (tenant) ID.
+/// 5. For confidential clients, create a client secret under **Certificates & secrets**.
+///
+/// # Scopes
+///
+/// Microsoft Entra ID uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `openid` | OpenID Connect authentication |
+/// | `profile` | User's profile information |
+/// | `email` | User's email address |
+/// | `User.Read` | Read user profile data |
+/// | `offline_access` | Request refresh tokens |
+///
+/// See the full list at <https://learn.microsoft.com/en-us/entra/identity-platform/scopes-oidc>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{MicrosoftEntraId, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// // Confidential client (with secret)
+/// let entra_id = MicrosoftEntraId::new(
+///     "common", // or your tenant ID
+///     "your-client-id",
+///     Some("your-client-secret".to_string()),
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = entra_id.authorization_url(&state, &["openid", "profile"], &code_verifier);
+/// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = entra_id
+///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = entra_id
+///     .refresh_access_token(&http, tokens.refresh_token()?, &["openid", "profile"])
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct MicrosoftEntraId {
     client_id: String,
     client_secret: Option<String>,
@@ -13,6 +76,40 @@ pub struct MicrosoftEntraId {
 }
 
 impl MicrosoftEntraId {
+    /// Creates a new Microsoft Entra ID OAuth 2.0 client.
+    ///
+    /// Endpoints are dynamically generated based on the tenant ID. Use `"common"` for
+    /// multi-tenant applications or your specific tenant ID for single-tenant apps.
+    ///
+    /// # Arguments
+    ///
+    /// * `tenant` - The Azure AD tenant ID or `"common"` for multi-tenant apps.
+    /// * `client_id` - The Application (client) ID from the Azure Portal.
+    /// * `client_secret` - The client secret for confidential clients, or `None` for public clients.
+    /// * `redirect_uri` - The URI Microsoft Entra ID will redirect to after authorization. Must match
+    ///   one of the redirect URIs configured in your app registration.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::MicrosoftEntraId;
+    ///
+    /// // Confidential client
+    /// let entra_id = MicrosoftEntraId::new(
+    ///     "common",
+    ///     "your-client-id",
+    ///     Some("your-client-secret".to_string()),
+    ///     "https://example.com/callback",
+    /// );
+    ///
+    /// // Public client (e.g., mobile app)
+    /// let public_client = MicrosoftEntraId::new(
+    ///     "common",
+    ///     "your-client-id",
+    ///     None,
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         tenant: impl Into<String>,
         client_id: impl Into<String>,
@@ -36,6 +133,28 @@ impl MicrosoftEntraId {
 
 #[cfg(any(test, feature = "testing"))]
 impl MicrosoftEntraId {
+    /// Creates a Microsoft Entra ID client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::MicrosoftEntraId;
+    ///
+    /// let entra_id = MicrosoftEntraId::with_endpoints(
+    ///     "test-client-id",
+    ///     Some("test-secret".to_string()),
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: Option<String>,
@@ -54,10 +173,42 @@ impl MicrosoftEntraId {
 }
 
 impl MicrosoftEntraId {
+    /// Returns the provider name (`"Microsoft Entra ID"`).
     pub fn name(&self) -> &'static str {
         "Microsoft Entra ID"
     }
 
+    /// Builds the Microsoft Entra ID authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 and PKCE parameters. Your
+    /// application should store `state` and `code_verifier` in the user's session
+    /// before redirecting, as both are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["openid", "profile"]`).
+    /// * `code_verifier` - The PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{MicrosoftEntraId, generate_state, generate_code_verifier};
+    ///
+    /// let entra_id = MicrosoftEntraId::new(
+    ///     "common",
+    ///     "client-id",
+    ///     Some("client-secret".to_string()),
+    ///     "https://example.com/cb"
+    /// );
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = entra_id.authorization_url(&state, &["openid", "profile"], &verifier);
+    /// assert!(url.as_str().starts_with("https://login.microsoftonline.com/"));
+    /// ```
     pub fn authorization_url(
         &self,
         state: &str,
@@ -86,6 +237,49 @@ impl MicrosoftEntraId {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Microsoft Entra ID redirects back with a
+    /// `code` query parameter. The `code_verifier` must be the same value used to generate the
+    /// authorization URL.
+    ///
+    /// For confidential clients (with a secret), credentials are sent via Basic auth. For public
+    /// clients (without a secret), the client ID is sent in the POST body and an `Origin` header
+    /// is added.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Microsoft Entra ID rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{MicrosoftEntraId, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let entra_id = MicrosoftEntraId::new(
+    ///     "common",
+    ///     "client-id",
+    ///     Some("secret".to_string()),
+    ///     "https://example.com/cb"
+    /// );
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = entra_id
+    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -121,6 +315,47 @@ impl MicrosoftEntraId {
         send_token_request(http_client, request).await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Use this to obtain a new access token without user interaction. To receive a refresh
+    /// token in the initial authorization, include the `offline_access` scope. You can
+    /// optionally specify scopes to request for the new token.
+    ///
+    /// For confidential clients, credentials are sent via Basic auth. For public clients,
+    /// the client ID is sent in the POST body.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    /// * `scopes` - Optional scopes for the new token. Pass an empty slice to use the original scopes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{MicrosoftEntraId, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let entra_id = MicrosoftEntraId::new(
+    ///     "common",
+    ///     "client-id",
+    ///     Some("secret".to_string()),
+    ///     "https://example.com/cb"
+    /// );
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = entra_id
+    ///     .refresh_access_token(&http, "stored-refresh-token", &["openid", "profile"])
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

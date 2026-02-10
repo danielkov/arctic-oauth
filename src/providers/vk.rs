@@ -6,6 +6,57 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://oauth.vk.com/authorize";
 const TOKEN_ENDPOINT: &str = "https://oauth.vk.com/access_token";
 
+/// OAuth 2.0 client for [VK (VKontakte)](https://dev.vk.com/api/access-token/getting-started).
+///
+/// VK does not require PKCE for authorization requests. This client supports the standard
+/// authorization code flow without PKCE. Credentials are sent in the request body rather
+/// than via HTTP Basic authentication.
+///
+/// # Setup
+///
+/// 1. Create an application in the [VK Developers Console](https://dev.vk.com/apps).
+/// 2. Obtain your client ID and client secret from the application settings.
+/// 3. Configure the authorized redirect URI in your application settings to match the `redirect_uri` you pass to [`VK::new`].
+///
+/// # Scopes
+///
+/// VK uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `friends` | Access to friends list |
+/// | `photos` | Access to photos |
+/// | `email` | Access to email address |
+/// | `wall` | Access to wall posts |
+///
+/// See the full list at <https://dev.vk.com/reference/access-rights>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{VK, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let vk = VK::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let url = vk.authorization_url(&state, &["friends", "email"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = vk
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct VK {
     client_id: String,
     client_secret: String,
@@ -15,6 +66,26 @@ pub struct VK {
 }
 
 impl VK {
+    /// Creates a new VK OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from VK Developers Console.
+    /// * `client_secret` - The OAuth 2.0 client secret from VK Developers Console.
+    /// * `redirect_uri` - The URI VK will redirect to after authorization. Must match
+    ///   one of the authorized redirect URIs configured in your VK application settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::VK;
+    ///
+    /// let vk = VK::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +103,28 @@ impl VK {
 
 #[cfg(any(test, feature = "testing"))]
 impl VK {
+    /// Creates a VK client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::VK;
+    ///
+    /// let vk = VK::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,10 +143,34 @@ impl VK {
 }
 
 impl VK {
+    /// Returns the provider name (`"VK"`).
     pub fn name(&self) -> &'static str {
         "VK"
     }
 
+    /// Builds the VK authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting, as it is needed
+    /// to prevent CSRF attacks.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["friends", "email"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{VK, generate_state};
+    ///
+    /// let vk = VK::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = vk.authorization_url(&state, &["friends", "email"]);
+    /// assert!(url.as_str().starts_with("https://oauth.vk.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -74,6 +191,38 @@ impl VK {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after VK redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if VK rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{VK, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let vk = VK::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = vk
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),

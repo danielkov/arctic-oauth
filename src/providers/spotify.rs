@@ -7,6 +7,65 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://accounts.spotify.com/authorize";
 const TOKEN_ENDPOINT: &str = "https://accounts.spotify.com/api/token";
 
+/// OAuth 2.0 client for [Spotify](https://developer.spotify.com/documentation/web-api/concepts/authorization).
+///
+/// Spotify supports optional PKCE with the S256 challenge method for enhanced security,
+/// especially recommended for mobile and desktop applications. This client supports the
+/// full authorization code flow including token refresh. The client can be configured as
+/// either a confidential client (with client secret) or a public client (without client secret).
+///
+/// # Setup
+///
+/// 1. Create an app in the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard).
+/// 2. Note your **Client ID** and **Client Secret** from the app settings.
+/// 3. Add a **Redirect URI** in the app settings that matches the `redirect_uri` you pass to [`Spotify::new`].
+///
+/// # Scopes
+///
+/// Spotify uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `user-read-email` | Read access to user's email address |
+/// | `user-read-private` | Read access to user's subscription details |
+/// | `playlist-read-private` | Read access to user's private playlists |
+/// | `playlist-modify-public` | Write access to user's public playlists |
+/// | `user-library-read` | Read access to user's library |
+///
+/// See the full list at <https://developer.spotify.com/documentation/web-api/concepts/scopes>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Spotify, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let spotify = Spotify::new(
+///     "your-client-id",
+///     Some("your-client-secret".to_string()),
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier (optional) and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = spotify.authorization_url(&state, &["user-read-email", "playlist-read-private"], Some(&code_verifier))?;
+/// // Store `state` and optionally `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = spotify
+///     .validate_authorization_code(&http, "authorization-code", Some(&code_verifier))
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = spotify
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Spotify {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -14,6 +73,35 @@ pub struct Spotify {
 }
 
 impl Spotify {
+    /// Creates a new Spotify OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from Spotify's developer dashboard.
+    /// * `client_secret` - The OAuth 2.0 client secret from Spotify's developer dashboard.
+    ///   Pass `None` to create a public client (for mobile/desktop apps with PKCE).
+    /// * `redirect_uri` - The URI Spotify will redirect to after authorization.
+    ///   Must match one configured in your Spotify app settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Spotify;
+    ///
+    /// // Confidential client (web apps)
+    /// let spotify = Spotify::new(
+    ///     "your-client-id",
+    ///     Some("your-client-secret".to_string()),
+    ///     "https://example.com/callback",
+    /// );
+    ///
+    /// // Public client (mobile/desktop apps)
+    /// let spotify_public = Spotify::new(
+    ///     "your-client-id",
+    ///     None,
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: Option<String>,
@@ -29,6 +117,28 @@ impl Spotify {
 
 #[cfg(any(test, feature = "testing"))]
 impl Spotify {
+    /// Creates a Spotify client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Spotify;
+    ///
+    /// let spotify = Spotify::with_endpoints(
+    ///     "test-client-id",
+    ///     Some("test-secret".to_string()),
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: Option<String>,
@@ -45,10 +155,44 @@ impl Spotify {
 }
 
 impl Spotify {
+    /// Returns the provider name (`"Spotify"`).
     pub fn name(&self) -> &'static str {
         "Spotify"
     }
 
+    /// Builds the Spotify authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters and optionally PKCE
+    /// parameters. Your application should store `state` (and `code_verifier` if PKCE is
+    /// used) in the user's session before redirecting, as they are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["user-read-email", "playlist-read-private"]`).
+    /// * `code_verifier` - Optional PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///   Pass `None` to skip PKCE.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Spotify, generate_state, generate_code_verifier};
+    ///
+    /// # fn example() -> Result<(), arctic_oauth::Error> {
+    /// let spotify = Spotify::new("client-id", Some("secret".to_string()), "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// // With PKCE
+    /// let url = spotify.authorization_url(&state, &["user-read-email"], Some(&verifier))?;
+    ///
+    /// // Without PKCE
+    /// let url_no_pkce = spotify.authorization_url(&state, &["user-read-email"], None)?;
+    /// # Ok(())
+    /// # }
+    /// ```
     pub fn authorization_url(
         &self,
         state: &str,
@@ -71,6 +215,41 @@ impl Spotify {
         }
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Spotify redirects back with a `code`
+    /// query parameter. If PKCE was used, the `code_verifier` must be the same value used
+    /// to generate the authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///   Pass `None` if PKCE was not used.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Spotify rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Spotify, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let spotify = Spotify::new("client-id", Some("secret".to_string()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = spotify
+    ///     .validate_authorization_code(&http, "the-auth-code", Some("the-code-verifier"))
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -82,6 +261,38 @@ impl Spotify {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Spotify access tokens typically expire after 1 hour. If your initial token response
+    /// included a refresh token, you can use it to obtain a new access token without user
+    /// interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Spotify, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let spotify = Spotify::new("client-id", Some("secret".to_string()), "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = spotify
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

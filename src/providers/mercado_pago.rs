@@ -7,6 +7,57 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://auth.mercadopago.com/authorization";
 const TOKEN_ENDPOINT: &str = "https://api.mercadopago.com/oauth/token";
 
+/// OAuth 2.0 client for [Mercado Pago](https://www.mercadopago.com/developers).
+///
+/// Mercado Pago requires PKCE with the S256 challenge method for authorization requests.
+/// This client supports the authorization code flow including token refresh. Note that
+/// Mercado Pago does not use traditional OAuth scopes; permissions are configured per
+/// application in your developer console.
+///
+/// # Setup
+///
+/// 1. Create an application in [Mercado Pago Developers](https://www.mercadopago.com/developers/panel).
+/// 2. Navigate to your application settings to obtain your **Client ID** and **Client Secret**.
+/// 3. Configure your redirect URI in the application settings to match the `redirect_uri`
+///    you pass to [`MercadoPago::new`].
+///
+/// # Scopes
+///
+/// Mercado Pago does not use explicit OAuth scopes. Application permissions are configured
+/// in your developer console and determine what resources your application can access.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{MercadoPago, ReqwestClient, generate_state, generate_code_verifier};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let mercado_pago = MercadoPago::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate PKCE verifier and CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let code_verifier = generate_code_verifier();
+/// let url = mercado_pago.authorization_url(&state, &code_verifier);
+/// // Store `state` and `code_verifier` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = mercado_pago
+///     .validate_authorization_code(&http, "authorization-code", &code_verifier)
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = mercado_pago
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct MercadoPago {
     client_id: String,
     client_secret: String,
@@ -16,6 +67,26 @@ pub struct MercadoPago {
 }
 
 impl MercadoPago {
+    /// Creates a new Mercado Pago OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from Mercado Pago Developers.
+    /// * `client_secret` - The OAuth 2.0 client secret from Mercado Pago Developers.
+    /// * `redirect_uri` - The URI Mercado Pago will redirect to after authorization. Must match
+    ///   one of the redirect URIs configured in your application settings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::MercadoPago;
+    ///
+    /// let mercado_pago = MercadoPago::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -33,6 +104,28 @@ impl MercadoPago {
 
 #[cfg(any(test, feature = "testing"))]
 impl MercadoPago {
+    /// Creates a Mercado Pago client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::MercadoPago;
+    ///
+    /// let mercado_pago = MercadoPago::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -51,10 +144,36 @@ impl MercadoPago {
 }
 
 impl MercadoPago {
+    /// Returns the provider name (`"MercadoPago"`).
     pub fn name(&self) -> &'static str {
         "MercadoPago"
     }
 
+    /// Builds the Mercado Pago authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 and PKCE parameters. Your
+    /// application should store `state` and `code_verifier` in the user's session
+    /// before redirecting, as both are needed to complete the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `code_verifier` - The PKCE code verifier. Use
+    ///   [`generate_code_verifier`](crate::generate_code_verifier) to create one.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{MercadoPago, generate_state, generate_code_verifier};
+    ///
+    /// let mercado_pago = MercadoPago::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    /// let verifier = generate_code_verifier();
+    ///
+    /// let url = mercado_pago.authorization_url(&state, &verifier);
+    /// assert!(url.as_str().starts_with("https://auth.mercadopago.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, code_verifier: &str) -> url::Url {
         let mut url =
             url::Url::parse(&self.authorization_endpoint).expect("invalid authorization endpoint");
@@ -71,6 +190,40 @@ impl MercadoPago {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Mercado Pago redirects back with a `code`
+    /// query parameter. The `code_verifier` must be the same value used to generate the
+    /// authorization URL.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    /// * `code_verifier` - The PKCE code verifier stored during the authorization step.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Mercado Pago rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{MercadoPago, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let mercado_pago = MercadoPago::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = mercado_pago
+    ///     .validate_authorization_code(&http, "the-auth-code", "the-code-verifier")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -89,6 +242,38 @@ impl MercadoPago {
         send_token_request(http_client, request).await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Mercado Pago access tokens typically expire after 6 hours. If your initial token response
+    /// included a refresh token, you can use it to obtain a new access token without user
+    /// interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{MercadoPago, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let mercado_pago = MercadoPago::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = mercado_pago
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

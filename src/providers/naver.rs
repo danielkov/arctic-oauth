@@ -6,6 +6,61 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://nid.naver.com/oauth2.0/authorize";
 const TOKEN_ENDPOINT: &str = "https://nid.naver.com/oauth2.0/token";
 
+/// OAuth 2.0 client for [Naver](https://developers.naver.com/docs/login/api/).
+///
+/// Naver does not use state, scopes, or PKCE parameters in the authorization flow.
+/// This client supports the authorization code flow including token refresh but not
+/// token revocation.
+///
+/// # Setup
+///
+/// 1. Register your application at the [Naver Developers](https://developers.naver.com/apps/#/register) page.
+/// 2. Obtain your Client ID and Client Secret from the application settings.
+/// 3. Configure the callback URL to match the `redirect_uri` you pass to [`Naver::new`].
+///
+/// # Scopes
+///
+/// Naver does not use explicit scopes in the OAuth flow. Instead, permissions are configured
+/// in the application settings on the Naver Developers portal. Available APIs include:
+///
+/// | API | Description |
+/// |-----|-------------|
+/// | Member Profile | Access user profile information |
+/// | Cafe | Access user's cafe information |
+/// | Blog | Access user's blog content |
+///
+/// See the full list at <https://developers.naver.com/docs/login/api/>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Naver, ReqwestClient};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let naver = Naver::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Redirect the user (no state or scopes required).
+/// let url = naver.authorization_url();
+/// // Redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = naver
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = naver
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Naver {
     client_id: String,
     client_secret: String,
@@ -15,6 +70,26 @@ pub struct Naver {
 }
 
 impl Naver {
+    /// Creates a new Naver OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from Naver Developers.
+    /// * `client_secret` - The OAuth 2.0 client secret from Naver Developers.
+    /// * `redirect_uri` - The URI Naver will redirect to after authorization. Must match
+    ///   the callback URL configured in your Naver application.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Naver;
+    ///
+    /// let naver = Naver::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +107,28 @@ impl Naver {
 
 #[cfg(any(test, feature = "testing"))]
 impl Naver {
+    /// Creates a Naver client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Naver;
+    ///
+    /// let naver = Naver::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,11 +147,25 @@ impl Naver {
 }
 
 impl Naver {
+    /// Returns the provider name (`"Naver"`).
     pub fn name(&self) -> &'static str {
         "Naver"
     }
 
-    /// No state and no scopes -- only response_type, client_id, redirect_uri.
+    /// Builds the Naver authorization URL that the user should be redirected to.
+    ///
+    /// Naver does not use state, scopes, or PKCE parameters. The authorization URL only
+    /// includes the response type, client ID, and redirect URI.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Naver;
+    ///
+    /// let naver = Naver::new("client-id", "secret", "https://example.com/cb");
+    /// let url = naver.authorization_url();
+    /// assert!(url.as_str().starts_with("https://nid.naver.com/"));
+    /// ```
     pub fn authorization_url(&self) -> url::Url {
         let mut url = url::Url::parse(&self.authorization_endpoint)
             .expect("invalid authorization endpoint URL");
@@ -69,6 +180,38 @@ impl Naver {
         url
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Naver redirects back with a `code`
+    /// query parameter. Credentials are sent in the POST body (not via Basic auth).
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Naver rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Naver, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let naver = Naver::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = naver
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -86,6 +229,37 @@ impl Naver {
         send_token_request(http_client, request).await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Naver uses the same token endpoint for both authorization code exchange and
+    /// token refresh. Credentials are sent in the POST body (not via Basic auth).
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Naver, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let naver = Naver::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = naver
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

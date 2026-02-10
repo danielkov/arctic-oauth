@@ -6,6 +6,59 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://api.login.yahoo.com/oauth2/request_auth";
 const TOKEN_ENDPOINT: &str = "https://api.login.yahoo.com/oauth2/get_token";
 
+/// OAuth 2.0 client for [Yahoo](https://developer.yahoo.com/oauth2/guide/).
+///
+/// Yahoo does not require PKCE for OAuth 2.0 authorization. This client supports the
+/// authorization code flow including token exchange and refresh.
+///
+/// # Setup
+///
+/// 1. Go to the [Yahoo Developer Network](https://developer.yahoo.com/apps/) and create a new app.
+/// 2. Configure your application and note the **Client ID** and **Client Secret**.
+/// 3. Set the **Redirect URI** to match the `redirect_uri` you pass to [`Yahoo::new`].
+///
+/// # Scopes
+///
+/// Yahoo uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `openid` | OpenID Connect authentication |
+/// | `profile` | User's basic profile information |
+/// | `email` | User's email address |
+/// | `sdps-r` | Read access to Yahoo services |
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Yahoo, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let yahoo = Yahoo::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state and redirect the user.
+/// let state = generate_state();
+/// let url = yahoo.authorization_url(&state, &["openid", "profile", "email"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = yahoo
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+///
+/// // Step 3 (optional): Refresh an expired access token.
+/// let refreshed = yahoo
+///     .refresh_access_token(&http, tokens.refresh_token()?)
+///     .await?;
+/// # Ok(())
+/// # }
+/// ```
 pub struct Yahoo {
     client: OAuth2Client,
     authorization_endpoint: String,
@@ -13,6 +66,26 @@ pub struct Yahoo {
 }
 
 impl Yahoo {
+    /// Creates a new Yahoo OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The OAuth 2.0 client ID from Yahoo Developer Network.
+    /// * `client_secret` - The OAuth 2.0 client secret from Yahoo Developer Network.
+    /// * `redirect_uri` - The URI Yahoo will redirect to after authorization.
+    ///   Must match the redirect URI configured in your Yahoo app.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Yahoo;
+    ///
+    /// let yahoo = Yahoo::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +105,28 @@ impl Yahoo {
 
 #[cfg(any(test, feature = "testing"))]
 impl Yahoo {
+    /// Creates a Yahoo client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Yahoo;
+    ///
+    /// let yahoo = Yahoo::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -52,15 +147,70 @@ impl Yahoo {
 }
 
 impl Yahoo {
+    /// Returns the provider name (`"Yahoo"`).
     pub fn name(&self) -> &'static str {
         "Yahoo"
     }
 
+    /// Builds the Yahoo authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application should
+    /// store `state` in the user's session before redirecting, as it is needed to complete
+    /// the flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["openid", "profile", "email"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Yahoo, generate_state};
+    ///
+    /// let yahoo = Yahoo::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = yahoo.authorization_url(&state, &["openid", "email"]);
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         self.client
             .create_authorization_url(&self.authorization_endpoint, state, scopes)
     }
 
+    /// Exchanges an authorization code for access and refresh tokens.
+    ///
+    /// Call this in your redirect URI handler after Yahoo redirects back with a `code`
+    /// query parameter.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Yahoo rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Yahoo, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let yahoo = Yahoo::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = yahoo
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
@@ -71,6 +221,38 @@ impl Yahoo {
             .await
     }
 
+    /// Refreshes an expired access token using a refresh token.
+    ///
+    /// Yahoo access tokens expire after a period of time. If your initial token response
+    /// included a refresh token, you can use it to obtain a new access token without user
+    /// interaction.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation.
+    /// * `refresh_token` - The refresh token from a previous token response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if the refresh token is invalid or revoked, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Yahoo, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let yahoo = Yahoo::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let new_tokens = yahoo
+    ///     .refresh_access_token(&http, "stored-refresh-token")
+    ///     .await?;
+    ///
+    /// println!("New access token: {}", new_tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn refresh_access_token(
         &self,
         http_client: &(impl HttpClient + ?Sized),

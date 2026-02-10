@@ -6,6 +6,58 @@ use crate::tokens::OAuth2Tokens;
 const AUTHORIZATION_ENDPOINT: &str = "https://www.facebook.com/v16.0/dialog/oauth";
 const TOKEN_ENDPOINT: &str = "https://graph.facebook.com/v16.0/oauth/access_token";
 
+/// OAuth 2.0 client for [Facebook](https://developers.facebook.com/docs/facebook-login).
+///
+/// Facebook does not require PKCE for authorization requests. This client supports the
+/// authorization code flow but does not support token refresh or revocation through standard
+/// OAuth 2.0 endpoints. Facebook uses space-separated scopes to control access to user data.
+///
+/// # Setup
+///
+/// 1. Create an app in [Meta for Developers](https://developers.facebook.com/apps/).
+/// 2. Add **Facebook Login** as a product to your app.
+/// 3. Navigate to **Facebook Login > Settings** and add your redirect URI to the
+///    **Valid OAuth Redirect URIs** list to match the `redirect_uri` you pass to [`Facebook::new`].
+///
+/// # Scopes
+///
+/// Facebook uses space-separated scopes. Common scopes include:
+///
+/// | Scope | Description |
+/// |-------|-------------|
+/// | `email` | Access to user's email address |
+/// | `public_profile` | Access to user's public profile info |
+/// | `user_friends` | Access to user's friends list |
+/// | `user_posts` | Access to user's posts |
+///
+/// See the full list at <https://developers.facebook.com/docs/permissions/reference>.
+///
+/// # Example
+///
+/// ```rust
+/// use arctic_oauth::{Facebook, ReqwestClient, generate_state};
+///
+/// # async fn example() -> Result<(), arctic_oauth::Error> {
+/// let facebook = Facebook::new(
+///     "your-client-id",
+///     "your-client-secret",
+///     "https://example.com/callback",
+/// );
+///
+/// // Step 1: Generate CSRF state, then redirect the user.
+/// let state = generate_state();
+/// let url = facebook.authorization_url(&state, &["email", "public_profile"]);
+/// // Store `state` in the user's session, then redirect to `url`.
+///
+/// // Step 2: In your callback handler, exchange the authorization code for tokens.
+/// let http = ReqwestClient::new();
+/// let tokens = facebook
+///     .validate_authorization_code(&http, "authorization-code")
+///     .await?;
+/// println!("Access token: {}", tokens.access_token()?);
+/// # Ok(())
+/// # }
+/// ```
 pub struct Facebook {
     client_id: String,
     client_secret: String,
@@ -15,6 +67,26 @@ pub struct Facebook {
 }
 
 impl Facebook {
+    /// Creates a new Facebook OAuth 2.0 client configured with production endpoints.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_id` - The App ID from Meta for Developers.
+    /// * `client_secret` - The App Secret from Meta for Developers.
+    /// * `redirect_uri` - The URI Facebook will redirect to after authorization. Must be listed
+    ///   in your app's Valid OAuth Redirect URIs.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::Facebook;
+    ///
+    /// let facebook = Facebook::new(
+    ///     "your-client-id",
+    ///     "your-client-secret",
+    ///     "https://example.com/callback",
+    /// );
+    /// ```
     pub fn new(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -32,6 +104,28 @@ impl Facebook {
 
 #[cfg(any(test, feature = "testing"))]
 impl Facebook {
+    /// Creates a Facebook client with custom endpoint URLs.
+    ///
+    /// This is useful for integration testing with mock servers (e.g.
+    /// [`wiremock`](https://docs.rs/wiremock)). Only available when the `testing` feature
+    /// is enabled or in `#[cfg(test)]` builds.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # #[cfg(feature = "testing")]
+    /// # {
+    /// use arctic_oauth::Facebook;
+    ///
+    /// let facebook = Facebook::with_endpoints(
+    ///     "test-client-id",
+    ///     "test-secret",
+    ///     "http://localhost/callback",
+    ///     "http://localhost:8080/authorize",
+    ///     "http://localhost:8080/token",
+    /// );
+    /// # }
+    /// ```
     pub fn with_endpoints(
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
@@ -50,10 +144,34 @@ impl Facebook {
 }
 
 impl Facebook {
+    /// Returns the provider name (`"Facebook"`).
     pub fn name(&self) -> &'static str {
         "Facebook"
     }
 
+    /// Builds the Facebook authorization URL that the user should be redirected to.
+    ///
+    /// The returned URL includes all required OAuth 2.0 parameters. Your application
+    /// should store `state` in the user's session before redirecting to verify the
+    /// callback request.
+    ///
+    /// # Arguments
+    ///
+    /// * `state` - A CSRF token to prevent cross-site request forgery. Use
+    ///   [`generate_state`](crate::generate_state) to create one.
+    /// * `scopes` - The OAuth 2.0 scopes to request (e.g. `&["email", "public_profile"]`).
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use arctic_oauth::{Facebook, generate_state};
+    ///
+    /// let facebook = Facebook::new("client-id", "client-secret", "https://example.com/cb");
+    /// let state = generate_state();
+    ///
+    /// let url = facebook.authorization_url(&state, &["email", "public_profile"]);
+    /// assert!(url.as_str().starts_with("https://www.facebook.com/"));
+    /// ```
     pub fn authorization_url(&self, state: &str, scopes: &[&str]) -> url::Url {
         let mut url =
             url::Url::parse(&self.authorization_endpoint).expect("invalid authorization endpoint");
@@ -70,6 +188,39 @@ impl Facebook {
         url
     }
 
+    /// Exchanges an authorization code for an access token.
+    ///
+    /// Call this in your redirect URI handler after Facebook redirects back with a `code`
+    /// query parameter. Note that Facebook does not provide refresh tokens through this
+    /// standard OAuth flow.
+    ///
+    /// # Arguments
+    ///
+    /// * `http_client` - An [`HttpClient`](crate::HttpClient) implementation (e.g.
+    ///   [`ReqwestClient`](crate::ReqwestClient)).
+    /// * `code` - The authorization code from the `code` query parameter.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::OAuthRequest`] if Facebook rejects the code, or
+    /// [`Error::Http`] on network failure.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// # use arctic_oauth::{Facebook, ReqwestClient};
+    /// # async fn example() -> Result<(), arctic_oauth::Error> {
+    /// let facebook = Facebook::new("client-id", "secret", "https://example.com/cb");
+    /// let http = ReqwestClient::new();
+    ///
+    /// let tokens = facebook
+    ///     .validate_authorization_code(&http, "the-auth-code")
+    ///     .await?;
+    ///
+    /// println!("Access token: {}", tokens.access_token()?);
+    /// # Ok(())
+    /// # }
+    /// ```
     pub async fn validate_authorization_code(
         &self,
         http_client: &(impl HttpClient + ?Sized),
