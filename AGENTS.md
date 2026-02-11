@@ -7,7 +7,7 @@ Rust port of [Arctic JS](https://github.com/pilcrowonpaper/arctic) — authoriza
 - **Rust** (edition 2024)
 - Core deps: `url`, `serde`/`serde_json`, `sha2`, `base64`, `rand`, `thiserror`
 - Optional deps: `reqwest` (HTTP client), `p256`/`ecdsa` (Apple Sign In)
-- Test deps: `tokio`, `wiremock`
+- Test deps: `tokio`
 
 ## Directory Structure
 

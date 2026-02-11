@@ -550,7 +550,6 @@ The crate ships 64 pre-configured providers, each behind its own feature flag. E
 
 ## Roadmap
 
-1. Expose higher-level helpers for multi-provider routing (e.g., a registry keyed by slug).
-2. Optional middleware utilities for Axum/Actix to streamline callback handling.
-3. Error reporting improvements (attach raw HTTP traces or response bodies behind feature flags).
-4. Explore lightweight JWT verification helpers without pulling full crypto stacks.
+1. Optional middleware utilities for Axum/Actix to streamline callback handling.
+2. Error reporting improvements (attach raw HTTP traces or response bodies behind feature flags).
+3. Explore lightweight JWT verification helpers without pulling full crypto stacks.
