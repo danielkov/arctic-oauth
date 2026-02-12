@@ -1,6 +1,6 @@
 [package]
 name = "arctic-oauth"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Authorization-code-flow-only OAuth 2.0 client library with 64 pre-configured providers"
 license = "MIT"
@@ -101,7 +101,7 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.9"
 thiserror = "2"
-reqwest = { version = "0.12", features = ["json"], optional = true }
+reqwest = { version = "0.13", features = ["json"], optional = true }
 p256 = { version = "0.13", optional = true }
 ecdsa = { version = "0.16", features = ["signing"], optional = true }
 
