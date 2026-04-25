@@ -427,6 +427,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_with_secret() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "polar-tok",
@@ -459,6 +460,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_without_secret() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "polar-tok",
@@ -488,6 +490,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_access_token_with_secret() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "new-tok",
@@ -511,6 +514,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_access_token_without_secret() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "new-tok",
@@ -536,6 +540,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_token_with_secret() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: vec![],
         }]);
@@ -556,6 +561,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_token_without_secret() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: vec![],
         }]);
@@ -579,6 +585,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_token_non_200_returns_error() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 503,
             body: vec![],
         }]);

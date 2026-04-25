@@ -388,6 +388,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_sends_body_credentials_with_redirect_uri() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "osu-tok",
@@ -422,6 +423,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_omits_redirect_uri_when_none() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "osu-tok",
@@ -445,6 +447,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_access_token_sends_body_credentials() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "new-tok",

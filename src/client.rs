@@ -351,6 +351,7 @@ mod tests {
     async fn validate_code_confidential_client_uses_basic_auth() {
         let client = OAuth2Client::new("my-id", Some("my-secret".into()), None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "tok",
@@ -377,6 +378,7 @@ mod tests {
     async fn validate_code_public_client_sends_client_id_in_body() {
         let client = OAuth2Client::new("pub-id", None, None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "tok",
@@ -402,6 +404,7 @@ mod tests {
     async fn validate_code_includes_code_verifier() {
         let client = OAuth2Client::new("cid", Some("sec".into()), None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "tok",
@@ -428,6 +431,7 @@ mod tests {
     async fn validate_code_omits_code_verifier_when_none() {
         let client = OAuth2Client::new("cid", Some("sec".into()), None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "tok",
@@ -449,6 +453,7 @@ mod tests {
     async fn validate_code_includes_redirect_uri() {
         let client = OAuth2Client::new("cid", Some("sec".into()), Some("https://app/cb".into()));
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "tok",
@@ -470,6 +475,7 @@ mod tests {
     async fn validate_code_sends_correct_grant_type() {
         let client = OAuth2Client::new("cid", Some("sec".into()), None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "tok",
@@ -494,6 +500,7 @@ mod tests {
     async fn refresh_token_sends_correct_body() {
         let client = OAuth2Client::new("cid", Some("sec".into()), None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "new-tok",
@@ -517,6 +524,7 @@ mod tests {
     async fn refresh_token_includes_scopes() {
         let client = OAuth2Client::new("cid", Some("sec".into()), None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "tok",
@@ -538,6 +546,7 @@ mod tests {
     async fn refresh_token_confidential_uses_basic_auth() {
         let client = OAuth2Client::new("cid", Some("sec".into()), None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "tok",
@@ -559,6 +568,7 @@ mod tests {
     async fn refresh_token_public_sends_client_id_in_body() {
         let client = OAuth2Client::new("pub-id", None, None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "tok",
@@ -583,6 +593,7 @@ mod tests {
     async fn revoke_token_sends_correct_body() {
         let client = OAuth2Client::new("cid", Some("sec".into()), None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: vec![],
         }]);
@@ -602,6 +613,7 @@ mod tests {
     async fn revoke_token_confidential_uses_basic_auth() {
         let client = OAuth2Client::new("cid", Some("sec".into()), None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: vec![],
         }]);
@@ -619,6 +631,7 @@ mod tests {
     async fn revoke_token_public_sends_client_id_in_body() {
         let client = OAuth2Client::new("pub-id", None, None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: vec![],
         }]);
@@ -637,6 +650,7 @@ mod tests {
     async fn revoke_token_non_200_returns_error() {
         let client = OAuth2Client::new("cid", Some("sec".into()), None);
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 503,
             body: vec![],
         }]);

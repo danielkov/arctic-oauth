@@ -1,18 +1,30 @@
 use std::future::Future;
 
-/// A minimal HTTP request representation (method is always POST for OAuth2).
+/// A minimal HTTP request representation.
 #[derive(Debug, Clone)]
 pub struct HttpRequest {
     pub url: String,
     pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+    pub method: http::Method,
 }
 
 /// A minimal HTTP response representation.
 #[derive(Debug, Clone)]
 pub struct HttpResponse {
     pub status: u16,
+    pub headers: Vec<(String, String)>,
     pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    /// Case-insensitive header lookup. Returns the first matching value.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
 }
 
 /// Trait for sending HTTP requests. Implementations must be `Send + Sync`
@@ -39,7 +51,7 @@ impl HttpClient for reqwest::Client {
         &self,
         req: HttpRequest,
     ) -> Result<HttpResponse, Box<dyn std::error::Error + Send + Sync>> {
-        let mut builder = self.post(&req.url);
+        let mut builder = self.request(req.method, &req.url);
 
         for (name, value) in &req.headers {
             builder = builder.header(name, value);
@@ -49,8 +61,21 @@ impl HttpClient for reqwest::Client {
 
         let response = builder.send().await?;
         let status = response.status().as_u16();
+        let headers: Vec<(String, String)> = response
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| {
+                v.to_str()
+                    .ok()
+                    .map(|v| (k.as_str().to_string(), v.to_string()))
+            })
+            .collect();
         let body = response.bytes().await?.to_vec();
 
-        Ok(HttpResponse { status, body })
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
     }
 }

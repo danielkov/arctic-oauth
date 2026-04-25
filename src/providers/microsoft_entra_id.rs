@@ -421,6 +421,7 @@ mod tests {
 
     fn success_response() -> HttpResponse {
         HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "test-token",

@@ -1,6 +1,8 @@
 mod client;
 mod error;
 mod http;
+#[cfg(feature = "oauth2_1")]
+mod oauth2_1;
 mod oidc;
 mod pkce;
 mod providers;
@@ -22,6 +24,16 @@ pub use state::generate_state;
 // Default HTTP client (behind feature flag)
 #[cfg(feature = "reqwest-client")]
 pub use http::default_client;
+
+// Generic OAuth 2.1 client (behind feature flag)
+#[cfg(feature = "oauth2_1")]
+pub use oauth2_1::{
+    AuthorizationCodeGrant, AuthorizationRequest, AuthorizationServerMetadata, AuthorizationUrl,
+    CallbackParams, ClientAuthenticationMethod, ClientCredentialsGrant, ClientRegistrationRequest,
+    IssuerPolicy, LoopbackHost, OAuth21Client, OAuth21Options, ProtectedResourceMetadata,
+    RedirectUri, RefreshTokenGrant, RegisteredClient, Resource, TokenIntrospection,
+    derive_well_known_url, parse_challenge_resource_metadata, register_client,
+};
 
 // Providers (each behind its own feature flag)
 #[cfg(feature = "amazon-cognito")]

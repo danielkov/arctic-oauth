@@ -366,6 +366,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_sends_body_credentials() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "da-tok",
@@ -397,6 +398,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_access_token_includes_scopes_in_body() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "new-tok",
@@ -426,6 +428,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_access_token_sends_empty_scope_when_no_scopes() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "new-tok",

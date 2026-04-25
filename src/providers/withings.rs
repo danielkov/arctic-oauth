@@ -400,6 +400,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_sends_action_requesttoken() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "status": 0,
@@ -439,6 +440,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_unwraps_nested_body() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "status": 0,
@@ -463,6 +465,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_handles_error_as_200() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "error": "invalid_request",
@@ -491,6 +494,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_non_zero_status_is_error() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "status": 503,
@@ -514,6 +518,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_missing_body_field() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "status": 0
@@ -533,6 +538,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_400_error() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 400,
             body: serde_json::to_vec(&serde_json::json!({
                 "error": "invalid_grant",
@@ -556,6 +562,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_unexpected_status() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 500,
             body: b"Internal Server Error".to_vec(),
         }]);

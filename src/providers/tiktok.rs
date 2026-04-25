@@ -508,6 +508,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_uses_client_key_in_body() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "tt-tok",
@@ -545,6 +546,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_handles_error_as_200() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "error": "invalid_request",
@@ -573,6 +575,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_400_error() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 400,
             body: serde_json::to_vec(&serde_json::json!({
                 "error": "invalid_grant",
@@ -596,6 +599,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_unexpected_status() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 500,
             body: b"Internal Server Error".to_vec(),
         }]);
@@ -612,6 +616,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_access_token_uses_client_key() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "new-tok",
@@ -637,6 +642,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_access_token_handles_error_as_200() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "error": "invalid_refresh_token",
@@ -665,6 +671,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_token_uses_client_key() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: vec![],
         }]);
@@ -685,6 +692,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_token_non_200_returns_error() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 503,
             body: vec![],
         }]);

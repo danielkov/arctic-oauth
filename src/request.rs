@@ -22,6 +22,7 @@ pub fn create_oauth2_request(endpoint: &str, body: &[(String, String)]) -> HttpR
             ("User-Agent".to_string(), "arctic-oauth".to_string()),
         ],
         body: encoded_body.into_bytes(),
+        method: http::Method::POST,
     }
 }
 
@@ -187,6 +188,7 @@ mod tests {
             "expires_in": 3600
         });
         let client = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&response_body).unwrap(),
         }]);
@@ -207,6 +209,7 @@ mod tests {
             "error_uri": "https://example.com/docs/errors"
         });
         let client = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 400,
             body: serde_json::to_vec(&error_body).unwrap(),
         }]);
@@ -239,6 +242,7 @@ mod tests {
             "error": "invalid_client",
         });
         let client = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 401,
             body: serde_json::to_vec(&error_body).unwrap(),
         }]);
@@ -265,6 +269,7 @@ mod tests {
     #[tokio::test]
     async fn send_token_request_unexpected_error_body_400() {
         let client = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 400,
             body: b"not json at all".to_vec(),
         }]);
@@ -286,6 +291,7 @@ mod tests {
         // Valid JSON but missing the "error" field
         let body = serde_json::json!({ "message": "something went wrong" });
         let client = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 400,
             body: serde_json::to_vec(&body).unwrap(),
         }]);
@@ -302,6 +308,7 @@ mod tests {
     #[tokio::test]
     async fn send_token_request_unexpected_status() {
         let client = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 500,
             body: b"Internal Server Error".to_vec(),
         }]);
@@ -315,6 +322,7 @@ mod tests {
     #[tokio::test]
     async fn send_token_request_records_request() {
         let client = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "tok",

@@ -1,6 +1,6 @@
 [package]
 name = "arctic-oauth"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Authorization-code-flow-only OAuth 2.0 client library with 64 pre-configured providers"
 license = "MIT"
@@ -76,21 +76,73 @@ workos = []
 yahoo = []
 yandex = []
 zoom = []
+oauth2_1 = []
 all-providers = [
-    "google", "github", "discord",
-    "forty-two", "amazon-cognito", "anilist", "apple", "atlassian",
-    "auth0", "authentik", "autodesk", "battle-net", "bitbucket",
-    "box-oauth", "bungie", "coinbase", "donation-alerts", "dribbble",
-    "dropbox", "epic-games", "etsy", "facebook", "figma",
-    "gitea", "gitlab", "intuit", "kakao", "keycloak",
-    "kick", "lichess", "line", "linear", "linkedin",
-    "mastodon", "mercado-libre", "mercado-pago", "microsoft-entra-id",
-    "my-anime-list", "naver", "notion", "okta", "osu",
-    "patreon", "polar", "reddit", "roblox", "salesforce",
-    "shikimori", "slack", "spotify", "start-gg", "strava",
-    "synology", "tiktok", "tiltify", "tumblr", "twitch",
-    "twitter", "vk", "withings", "workos", "yahoo",
-    "yandex", "zoom",
+    "google",
+    "github",
+    "discord",
+    "forty-two",
+    "amazon-cognito",
+    "anilist",
+    "apple",
+    "atlassian",
+    "auth0",
+    "authentik",
+    "autodesk",
+    "battle-net",
+    "bitbucket",
+    "box-oauth",
+    "bungie",
+    "coinbase",
+    "donation-alerts",
+    "dribbble",
+    "dropbox",
+    "epic-games",
+    "etsy",
+    "facebook",
+    "figma",
+    "gitea",
+    "gitlab",
+    "intuit",
+    "kakao",
+    "keycloak",
+    "kick",
+    "lichess",
+    "line",
+    "linear",
+    "linkedin",
+    "mastodon",
+    "mercado-libre",
+    "mercado-pago",
+    "microsoft-entra-id",
+    "my-anime-list",
+    "naver",
+    "notion",
+    "okta",
+    "osu",
+    "patreon",
+    "polar",
+    "reddit",
+    "roblox",
+    "salesforce",
+    "shikimori",
+    "slack",
+    "spotify",
+    "start-gg",
+    "strava",
+    "synology",
+    "tiktok",
+    "tiltify",
+    "tumblr",
+    "twitch",
+    "twitter",
+    "vk",
+    "withings",
+    "workos",
+    "yahoo",
+    "yandex",
+    "zoom",
+    "oauth2_1",
 ]
 
 [dependencies]
@@ -104,6 +156,12 @@ thiserror = "2"
 reqwest = { version = "0.13", features = ["json"], optional = true }
 p256 = { version = "0.13", optional = true }
 ecdsa = { version = "0.16", features = ["signing"], optional = true }
+http = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
+webbrowser = "1"
+
+[[example]]
+name = "oauth21"
+required-features = ["oauth2_1", "reqwest-client"]

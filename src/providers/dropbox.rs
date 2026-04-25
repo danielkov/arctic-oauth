@@ -401,6 +401,7 @@ mod tests {
     #[tokio::test]
     async fn validate_authorization_code_delegates_to_client() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "dropbox-tok",
@@ -426,6 +427,7 @@ mod tests {
     #[tokio::test]
     async fn refresh_access_token_delegates_to_client() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: serde_json::to_vec(&serde_json::json!({
                 "access_token": "new-tok",
@@ -443,6 +445,7 @@ mod tests {
     #[tokio::test]
     async fn revoke_token_delegates_to_client() {
         let mock = MockHttpClient::new(vec![HttpResponse {
+            headers: vec![],
             status: 200,
             body: vec![],
         }]);
